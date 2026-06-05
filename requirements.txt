@@ -1,0 +1,19 @@
+# AnimeEncoderBot - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Telegram Bot Framework (async)
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
+
+# MongoDB async driver
+motor>=3.3.0
+pymongo>=4.6.0
+
+# Environment config
+python-dotenv>=1.0.0
+
+# Async utilities
+aiofiles>=23.0.0
+
+# HTTP client (for webhook/API calls if needed)
+aiohttp>=3.9.0

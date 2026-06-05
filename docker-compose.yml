@@ -1,0 +1,40 @@
+# ============================================
+# AnimeEncoderBot - Docker Compose
+# Requires: NVIDIA Container Toolkit
+# ============================================
+
+version: "3.8"
+
+services:
+  bot:
+    build: .
+    container_name: anime-encoder-bot
+    restart: unless-stopped
+    env_file:
+      - config.env
+    volumes:
+      - ./downloads:/app/downloads
+      - bot-sessions:/app/AnimeEncoderBot.session
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      - mongo
+
+  mongo:
+    image: mongo:7
+    container_name: anime-encoder-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    ports:
+      - "27017:27017"
+    command: mongod --quiet --logpath /dev/null
+
+volumes:
+  mongo-data:
+  bot-sessions:

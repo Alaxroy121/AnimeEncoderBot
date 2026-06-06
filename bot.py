@@ -1,19 +1,27 @@
 """
 AnimeEncoderBot — Main entry point.
 Telegram bot for GPU-accelerated video encoding (AV1/HEVC) and AI anime upscaling.
+Uses python-telegram-bot (Bot API) for reliable message handling.
 """
 
 import asyncio
 import logging
 import os
+import random
 import sys
+import traceback
 from pathlib import Path
 
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
-from callbacks import register_callbacks, get_workflow, clear_workflow, set_workflow
-from commands import register_commands
 from config import Config
 from database import db
 from encoder import encoder, EncodeSettings
@@ -42,356 +50,349 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Silence noisy loggers
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
-logging.getLogger("pymongo").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
+# ── User workflow state (in-memory) ───────────────────────────────────
+user_workflows: dict[int, dict] = {}
 
-# ── Bot Initialization ────────────────────────────────────────────────
+def get_workflow(user_id: int) -> dict | None:
+    return user_workflows.get(user_id)
 
-def create_app() -> Client:
-    """Create and configure the Pyrogram client."""
-    errors = Config.validate()
-    if errors:
-        for err in errors:
-            logger.error("Config error: %s", err)
-        sys.exit(1)
+def set_workflow(user_id: int, data: dict) -> None:
+    user_workflows[user_id] = data
 
-    Config.ensure_dirs()
+def clear_workflow(user_id: int) -> None:
+    user_workflows.pop(user_id, None)
 
-    # Remove stale session files that can block Pyrogram from connecting
-    session_file = Path(__file__).parent / "AnimeEncoderBot.session"
-    session_journal = Path(__file__).parent / "AnimeEncoderBot.session-journal"
-    for sf in [session_file, session_journal]:
-        if sf.exists():
-            sf.unlink()
-            logger.info("Removed stale session file: %s", sf)
+# ── Welcome images ────────────────────────────────────────────────────
+ASSETS_DIR = Path(__file__).parent / "assets"
 
-    app = Client(
-        name="AnimeEncoderBot",
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH,
-        bot_token=Config.BOT_TOKEN,
-        workdir=str(Path(__file__).parent),
-        in_memory=True,  # Don't persist session to disk — avoids session conflicts
-    )
-    return app
+def get_random_welcome_image() -> Path | None:
+    images = sorted(ASSETS_DIR.glob("welcome_*.png"))
+    return random.choice(images) if images else None
 
+# ── Keyboards ─────────────────────────────────────────────────────────
+def codec_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 AV1 (SVT-AV1)", callback_data="codec_av1"),
+            InlineKeyboardButton("🎬 HEVC (H.265)", callback_data="codec_hevc"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
+    ])
 
-app = create_app()
+def quality_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Low (Fast)", callback_data="quality_low"),
+            InlineKeyboardButton("⚖️ Medium", callback_data="quality_medium"),
+        ],
+        [
+            InlineKeyboardButton("✨ High", callback_data="quality_high"),
+            InlineKeyboardButton("💎 Ultra (Slow)", callback_data="quality_ultra"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
+    ])
 
+def preset_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏃 Fast", callback_data="preset_fast"),
+            InlineKeyboardButton("⚖️ Medium", callback_data="preset_medium"),
+        ],
+        [
+            InlineKeyboardButton("🐢 Slow", callback_data="preset_slow"),
+            InlineKeyboardButton("🐌 Very Slow", callback_data="preset_veryslow"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
+    ])
 
-# ── Task Processor ────────────────────────────────────────────────────
+def audio_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy (No Re-encode)", callback_data="audio_copy")],
+        [
+            InlineKeyboardButton("🔊 AAC 192k", callback_data="audio_aac"),
+            InlineKeyboardButton("🔊 Opus 192k", callback_data="audio_opus"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
+    ])
 
-async def process_task(task: Task) -> None:
-    """Process an encoding or upscaling task.
+def resolution_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📺 1080p (FHD)", callback_data="res_1080p"),
+            InlineKeyboardButton("🖥 2K (QHD)", callback_data="res_2k"),
+        ],
+        [
+            InlineKeyboardButton("📽 4K (UHD)", callback_data="res_4k"),
+            InlineKeyboardButton("🎬 8K (FUHD)", callback_data="res_8k"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
+    ])
 
-    This is the main worker function called by QueueManager.
-    """
-    chat_id = task.progress_chat_id
-    msg_id = task.progress_message_id
-    input_file = task.input_file
-    output_file: str = ""
+# ── Command Handlers ──────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome message with anime waifu image."""
+    user = update.effective_user
+    logger.info("/start from %s (%s)", user.first_name, user.id)
 
     try:
-        # Update progress message
-        if chat_id and msg_id:
-            await app.edit_message_text(
-                chat_id, msg_id,
-                f"⚙️ **{'Encoding' if task.task_type == TaskType.ENCODE else 'Upscaling'}...**\n\n"
-                f"⏳ Starting up...",
-            )
-
-        if task.task_type == TaskType.ENCODE:
-            output_file = await _process_encode(task)
-        elif task.task_type == TaskType.UPSCALE:
-            output_file = await _process_upscale(task)
-
-        # Upload result
-        if output_file and Path(output_file).exists():
-            await _upload_result(task, output_file)
-        else:
-            raise RuntimeError("Processing produced no output file")
-
-    except asyncio.CancelledError:
-        if chat_id:
-            await app.send_message(chat_id, "❌ Task cancelled.")
-        raise
-
+        await db.add_user(user.id, user.username or "")
     except Exception as e:
-        logger.error("Task %s failed: %s", task.task_id, e, exc_info=True)
-        if chat_id:
-            await app.send_message(
-                chat_id,
-                f"❌ **Task Failed**\n\n`{str(e)[:500]}`\n\n"
-                f"Task ID: `{task.task_id}`",
-            )
-        raise
+        logger.warning("DB add_user failed (non-fatal): %s", e)
 
-    finally:
-        # Cleanup temp files
-        cleanup_files(input_file)
-        if output_file:
-            cleanup_files(output_file)
-        clear_workflow(task.user_id)
+    gpu_status = f"✅ {encoder.gpu_name}" if encoder.gpu_available else "❌ CPU mode"
+    upscaler_status = "✅ Available" if upscaler._available else "❌ Not installed"
 
-
-async def _process_encode(task: Task) -> str:
-    """Run the encoding pipeline."""
-    settings = EncodeSettings(
-        codec=task.settings.get("codec", Config.DEFAULT_CODEC),
-        quality=task.settings.get("quality", "medium"),
-        preset=task.settings.get("preset", "medium"),
-        audio_codec=task.settings.get("audio", "copy"),
-        use_gpu=Config.GPU_ENABLED,
+    welcome_text = (
+        f"👋 **Hello {user.first_name}!**\n\n"
+        f"🎬 I am **AnimeEncoderBot**\n"
+        f"_Professional AI-Enhanced Video Encoding._\n\n"
+        f"• 🧠 AI Upscaling: Real-ESRGAN (Anime V3)\n"
+        f"• 🎬 Codecs: H.265 (HEVC) / AV1\n"
+        f"• 📺 Resolution: Up to 8K\n"
+        f"• ⚡ GPU: {gpu_status}\n"
+        f"• 🔍 Upscaler: {upscaler_status}\n\n"
+        f"**📋 Quick Start**\n"
+        f"├ /encode — Encode video (AV1 / HEVC)\n"
+        f"├ /upscale — AI upscale anime video\n"
+        f"├ /help — Full command list\n"
+        f"└ /settings — Your preferences"
     )
 
-    chat_id = task.progress_chat_id
-    msg_id = task.progress_message_id
-
-    # Progress callback
-    tracker = ProgressTracker(total=100)
-
-    def on_progress(current: float, total: float) -> None:
-        tracker.total = total
-        if tracker.update(current):
-            text = tracker.format_progress("Encoding")
-            if chat_id and msg_id:
-                asyncio.get_event_loop().create_task(
-                    _safe_edit(chat_id, msg_id, text)
-                )
-
-    output_path = await encoder.encode(
-        input_path=task.input_file,
-        settings=settings,
-        progress_callback=on_progress,
-    )
-
-    await db.update_task(task.task_id, {"output_file": output_path})
-    return output_path
-
-
-async def _process_upscale(task: Task) -> str:
-    """Run the upscaling pipeline."""
-    resolution = task.settings.get("resolution", "4k")
-    chat_id = task.progress_chat_id
-    msg_id = task.progress_message_id
-
-    total_frames_est = 1000  # Will be updated
-
-    def on_progress(current: int, total: int) -> None:
-        nonlocal total_frames_est
-        total_frames_est = total
-        percent = (current / total * 100) if total > 0 else 0
-        text = (
-            f"🔍 **Upscaling to {resolution.upper()}**\n\n"
-            f"🖼 Frames: `{current}/{total}`\n"
-            f"📊 Progress: `{percent:.1f}%`\n"
-            f"🤖 Model: Real-ESRGAN Anime V3"
-        )
-        if chat_id and msg_id:
-            asyncio.get_event_loop().create_task(
-                _safe_edit(chat_id, msg_id, text)
-            )
-
-    output_path = await upscaler.upscale(
-        input_path=task.input_file,
-        target_resolution=resolution,
-        progress_callback=on_progress,
-    )
-
-    await db.update_task(task.task_id, {"output_file": output_path})
-    return output_path
-
-
-async def _upload_result(task: Task, output_path: str) -> None:
-    """Upload the result file.
-
-    - Files < 2GB → Direct Telegram upload (Pyrogram handles up to 2GB with API ID/Hash)
-    - Files > 2GB → Google Drive upload via Service Account, sends link in chat
-    """
-    chat_id = task.progress_chat_id
-    if not chat_id:
-        return
-
-    file_size = Path(output_path).stat().st_size
-    task_label = "Encoding" if task.task_type == TaskType.ENCODE else "Upscaling"
-
-    # Get media info for the caption
-    info = await get_media_info(output_path)
-    info_lines = ""
-    if info and info.get("video"):
-        v = info["video"]
-        info_lines = (
-            f"\n📐 Resolution: `{v['width']}×{v['height']}`"
-            f"\n🎬 Codec: `{v['codec']}`"
-        )
-
-    if file_size <= Config.TG_UPLOAD_LIMIT:
-        # ── Direct Telegram upload (< 2GB) with progress ──
-        caption = (
-            f"✅ **{task_label} Complete!**\n\n"
-            f"💾 Size: `{human_size(file_size)}`\n"
-            f"🆔 Task: `{task.task_id}`"
-            f"{info_lines}"
-        )
-
-        upload_msg = await app.send_message(
-            chat_id,
-            f"📤 **Uploading to Telegram...**\n\n"
-            f"💾 Size: `{human_size(file_size)}`\n"
-            f"⏳ Starting upload..."
-        )
-
-        ul_last_update = [0.0]
-
-        async def upload_progress(current: int, total: int) -> None:
-            import time
-            now = time.time()
-            if now - ul_last_update[0] < 3:
-                return
-            ul_last_update[0] = now
-            percent = (current / total * 100) if total > 0 else 0
-            bar_len = 20
-            filled = int(bar_len * current / total) if total > 0 else 0
-            bar = "█" * filled + "░" * (bar_len - filled)
-            await _safe_edit(
-                chat_id, upload_msg.id,
-                f"📤 **Uploading to Telegram...**\n\n"
-                f"[{bar}] `{percent:.1f}%`\n"
-                f"💾 `{human_size(current)}` / `{human_size(total)}`"
-            )
-
+    welcome_img = get_random_welcome_image()
+    if welcome_img and welcome_img.exists():
         try:
-            await app.send_document(
-                chat_id,
-                document=output_path,
-                caption=caption,
-                force_document=True,
-                progress=upload_progress,
+            await update.message.reply_photo(
+                photo=open(welcome_img, "rb"),
+                caption=welcome_text,
+                parse_mode="Markdown",
             )
-            # Delete the progress message after successful upload
-            try:
-                await upload_msg.delete()
-            except Exception:
-                pass
-        except Exception as e:
-            logger.error("Telegram upload failed: %s", e)
-            await upload_msg.edit_text(
-                f"❌ Telegram upload failed: `{str(e)[:300]}`\n\n"
-                "Trying Google Drive fallback...",
-            )
-            # Fall through to GDrive
-            await _upload_to_gdrive(task, output_path, file_size, task_label, info_lines, chat_id)
-    else:
-        # ── Google Drive upload (> 2GB) ──
-        await _upload_to_gdrive(task, output_path, file_size, task_label, info_lines, chat_id)
-
-    # Log to channel
-    if Config.LOG_CHANNEL:
-        try:
-            method = "Telegram" if file_size <= Config.TG_UPLOAD_LIMIT else "GDrive"
-            await app.send_message(
-                Config.LOG_CHANNEL,
-                f"✅ Task completed\n"
-                f"👤 User: `{task.user_id}`\n"
-                f"📋 Type: `{task.task_type.value}`\n"
-                f"💾 Size: `{human_size(file_size)}`\n"
-                f"📤 Upload: `{method}`\n"
-                f"🆔 Task: `{task.task_id}`",
-            )
-        except Exception as e:
-            logger.warning("Failed to log to channel: %s", e)
-
-
-async def _upload_to_gdrive(
-    task: Task,
-    output_path: str,
-    file_size: int,
-    task_label: str,
-    info_lines: str,
-    chat_id: int,
-) -> None:
-    """Upload a file to Google Drive and send the link."""
-    if not gdrive.is_configured():
-        await app.send_message(
-            chat_id,
-            f"❌ **File too large for Telegram** (`{human_size(file_size)}`)\n\n"
-            "Google Drive is not configured.\n"
-            "Ask the admin to set `GDRIVE_SA_JSON` and `GDRIVE_FOLDER_ID` in config.",
-        )
-        return
-
-    progress_msg = await app.send_message(
-        chat_id,
-        f"📤 **Uploading to Google Drive...**\n\n"
-        f"💾 Size: `{human_size(file_size)}`\n"
-        f"⏳ This may take a while for large files...",
-    )
-
-    last_update = [0.0]
-
-    def on_gdrive_progress(uploaded: int, total: int) -> None:
-        import time
-        now = time.time()
-        if now - last_update[0] < 5:  # Throttle updates to every 5s
             return
-        last_update[0] = now
-        percent = (uploaded / total * 100) if total > 0 else 0
-        asyncio.get_event_loop().create_task(
-            _safe_edit(
-                chat_id, progress_msg.id,
-                f"📤 **Uploading to Google Drive...**\n\n"
-                f"💾 `{human_size(uploaded)}` / `{human_size(total)}`\n"
-                f"📊 `{percent:.1f}%`",
-            )
-        )
+        except Exception as e:
+            logger.warning("Failed to send welcome image: %s", e)
+
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detailed help."""
+    await update.message.reply_text(
+        "📖 **AnimeEncoderBot — Help**\n\n"
+        "**Encoding Commands**\n"
+        "├ /encode — Start encoding workflow\n"
+        "│   Choose codec → quality → preset → audio → send video\n"
+        "│   Codecs: **AV1** (SVT-AV1) or **HEVC** (H.265 NVENC)\n\n"
+        "**Upscaling Commands**\n"
+        "├ /upscale — AI upscale (anime optimized)\n"
+        "│   Choose resolution → send video\n"
+        "│   Targets: 1080p, 2K, 4K, 8K\n"
+        "│   Model: Real-ESRGAN Anime V3\n\n"
+        "**General Commands**\n"
+        "├ /status — Check your current task\n"
+        "├ /cancel — Cancel your active task\n"
+        "├ /queue — View the task queue\n"
+        "├ /settings — Your default preferences\n\n"
+        f"**Supported formats:** MP4, MKV, AVI, MOV, WebM, etc.\n"
+        f"**Max file size:** {human_size(Config.MAX_FILE_SIZE)}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_encode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start encoding workflow."""
+    user_id = update.effective_user.id
 
     try:
-        result = await gdrive.upload(
-            file_path=output_path,
-            filename=Path(output_path).name,
-            progress_callback=on_gdrive_progress,
-        )
-
-        await progress_msg.edit_text(
-            f"✅ **{task_label} Complete!**\n\n"
-            f"💾 Size: `{human_size(file_size)}`\n"
-            f"🆔 Task: `{task.task_id}`"
-            f"{info_lines}\n\n"
-            f"📁 **Google Drive Link:**\n"
-            f"{result['link']}",
-        )
-
-    except Exception as e:
-        logger.error("GDrive upload failed for task %s: %s", task.task_id, e, exc_info=True)
-        await progress_msg.edit_text(
-            f"❌ **Google Drive upload failed**\n\n"
-            f"`{str(e)[:400]}`\n\n"
-            f"File size: `{human_size(file_size)}`",
-        )
-
-
-async def _safe_edit(chat_id: int, message_id: int, text: str) -> None:
-    """Edit a message, ignoring errors (flood, not modified, etc.)."""
-    try:
-        await app.edit_message_text(chat_id, message_id, text)
+        if await db.is_banned(user_id):
+            await update.message.reply_text("🚫 You are banned.")
+            return
     except Exception:
         pass
 
+    set_workflow(user_id, {"type": "encode", "awaiting_file": False})
 
-# ── File Handler (receives videos after workflow setup) ───────────────
+    await update.message.reply_text(
+        "🎬 **Video Encoding**\n\nChoose your codec:",
+        reply_markup=codec_keyboard(),
+        parse_mode="Markdown",
+    )
 
-@app.on_message(filters.private & (filters.video | filters.document | filters.animation))
-async def on_file_received(client: Client, message: Message) -> None:
-    """Handle incoming video files."""
-    user_id = message.from_user.id
 
-    # Check ban
-    if await db.is_banned(user_id):
-        await message.reply_text("🚫 You are banned from using this bot.")
+async def cmd_upscale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start upscaling workflow."""
+    user_id = update.effective_user.id
+
+    try:
+        if await db.is_banned(user_id):
+            await update.message.reply_text("🚫 You are banned.")
+            return
+    except Exception:
+        pass
+
+    if not upscaler._available:
+        await update.message.reply_text(
+            "❌ **Upscaler Not Available**\n\n"
+            "Real-ESRGAN is not installed on this server."
+        )
         return
 
-    # Check workflow
+    set_workflow(user_id, {"type": "upscale", "awaiting_file": False})
+
+    await update.message.reply_text(
+        "🔍 **AI Anime Upscaling**\n\n"
+        "Using **Real-ESRGAN Anime V3** model.\n\n"
+        "Choose target resolution:",
+        reply_markup=resolution_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check current task status."""
+    user_id = update.effective_user.id
+    try:
+        active = await db.get_user_active_task(user_id)
+    except Exception:
+        active = None
+
+    if not active:
+        await update.message.reply_text("📭 No active tasks. Use /encode or /upscale to start.")
+        return
+
+    status = active.get("status", "unknown")
+    await update.message.reply_text(
+        f"📋 **Task Status**\n\n"
+        f"🆔 ID: `{active['task_id']}`\n"
+        f"📋 Type: **{active.get('type', 'unknown')}**\n"
+        f"📊 Status: **{status}**",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel active task."""
+    user_id = update.effective_user.id
+    clear_workflow(user_id)
+
+    try:
+        active = await db.get_user_active_task(user_id)
+        if active:
+            await queue_manager.cancel_task(active["task_id"])
+            await update.message.reply_text(f"✅ Task `{active['task_id']}` cancelled.")
+            return
+    except Exception:
+        pass
+
+    await update.message.reply_text("📭 No active task to cancel.")
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the task queue."""
+    try:
+        info = await queue_manager.get_queue_info()
+        await update.message.reply_text(
+            f"📋 **Task Queue**\n\n"
+            f"⏳ Queued: **{info['queued']}**\n"
+            f"⚙️ Processing: **{info['processing']}**\n"
+            f"👷 Workers: **{info['total_workers']}**",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+
+# ── Callback Query Handlers ───────────────────────────────────────────
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle all inline button callbacks."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+    wf = get_workflow(user_id)
+
+    if data == "cancel_workflow":
+        clear_workflow(user_id)
+        await query.message.edit_text("❌ Workflow cancelled.")
+        return
+
+    if not wf:
+        await query.message.edit_text("⚠️ No active workflow. Use /encode or /upscale first.")
+        return
+
+    # ── Encoding flow ──
+    if data.startswith("codec_"):
+        wf["codec"] = data.replace("codec_", "")
+        set_workflow(user_id, wf)
+        await query.message.edit_text(
+            f"🎬 Codec: **{wf['codec'].upper()}**\n\nChoose quality level:",
+            reply_markup=quality_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("quality_"):
+        wf["quality"] = data.replace("quality_", "")
+        set_workflow(user_id, wf)
+        await query.message.edit_text(
+            f"🎬 Codec: **{wf['codec'].upper()}**\n"
+            f"✨ Quality: **{wf['quality'].capitalize()}**\n\n"
+            f"Choose encoding speed preset:",
+            reply_markup=preset_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("preset_"):
+        wf["preset"] = data.replace("preset_", "")
+        set_workflow(user_id, wf)
+        await query.message.edit_text(
+            f"🎬 Codec: **{wf['codec'].upper()}**\n"
+            f"✨ Quality: **{wf['quality'].capitalize()}**\n"
+            f"🏃 Preset: **{wf['preset'].capitalize()}**\n\n"
+            f"Choose audio handling:",
+            reply_markup=audio_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("audio_"):
+        wf["audio"] = data.replace("audio_", "")
+        wf["awaiting_file"] = True
+        set_workflow(user_id, wf)
+        await query.message.edit_text(
+            f"📋 **Encoding Settings**\n\n"
+            f"🎬 Codec: **{wf['codec'].upper()}**\n"
+            f"✨ Quality: **{wf['quality'].capitalize()}**\n"
+            f"🏃 Preset: **{wf['preset'].capitalize()}**\n"
+            f"🔊 Audio: **{wf['audio'].upper()}**\n\n"
+            f"✅ **Now send your video file!**",
+            parse_mode="Markdown",
+        )
+
+    # ── Upscaling flow ──
+    elif data.startswith("res_"):
+        wf["resolution"] = data.replace("res_", "")
+        wf["awaiting_file"] = True
+        set_workflow(user_id, wf)
+        res_labels = {"1080p": "1920×1080", "2k": "2560×1440", "4k": "3840×2160", "8k": "7680×4320"}
+        await query.message.edit_text(
+            f"🔍 **Upscaling Settings**\n\n"
+            f"📐 Target: **{wf['resolution'].upper()}** ({res_labels.get(wf['resolution'], '')})\n"
+            f"🤖 Model: **Real-ESRGAN (Anime V3)**\n\n"
+            f"✅ **Now send your video file!**",
+            parse_mode="Markdown",
+        )
+
+
+# ── File Handler ──────────────────────────────────────────────────────
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming video files."""
+    user_id = update.effective_user.id
+    message = update.message
+
     wf = get_workflow(user_id)
     if not wf or not wf.get("awaiting_file"):
         await message.reply_text(
@@ -400,13 +401,17 @@ async def on_file_received(client: Client, message: Message) -> None:
         )
         return
 
-    # Validate file
-    file = message.video or message.document or message.animation
-    if not file:
+    # Get file info
+    if message.video:
+        file = message.video
+        filename = file.file_name or "video.mp4"
+    elif message.document:
+        file = message.document
+        filename = file.file_name or "video.mp4"
+    else:
         await message.reply_text("⚠️ Please send a video file.")
         return
 
-    filename = getattr(file, "file_name", None) or "video.mp4"
     if not is_supported_video(filename):
         await message.reply_text(
             f"⚠️ Unsupported format: `{filename}`\n\n"
@@ -422,44 +427,17 @@ async def on_file_received(client: Client, message: Message) -> None:
         )
         return
 
-    # Check for existing active task
-    active = await db.get_user_active_task(user_id)
-    if active:
-        await message.reply_text(
-            "⚠️ You already have an active task.\n"
-            "Use /cancel to cancel it, or /status to check progress."
-        )
-        return
-
-    # ── Download with progress ──
+    # Download with progress
     progress_msg = await message.reply_text(
         f"📥 **Downloading...**\n\n"
         f"💾 Size: `{human_size(file_size)}`\n"
         f"⏳ Starting download..."
     )
 
-    dl_last_update = [0.0]
-
-    async def download_progress(current: int, total: int) -> None:
-        import time
-        now = time.time()
-        if now - dl_last_update[0] < 3:  # Throttle to every 3s
-            return
-        dl_last_update[0] = now
-        percent = (current / total * 100) if total > 0 else 0
-        bar_len = 20
-        filled = int(bar_len * current / total) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_len - filled)
-        await _safe_edit(
-            message.chat.id, progress_msg.id,
-            f"📥 **Downloading...**\n\n"
-            f"[{bar}] `{percent:.1f}%`\n"
-            f"💾 `{human_size(current)}` / `{human_size(total)}`"
-        )
-
     try:
         download_path = os.path.join(Config.DOWNLOAD_DIR, f"{user_id}_{filename}")
-        await message.download(file_name=download_path, progress=download_progress)
+        tg_file = await file.get_file()
+        await tg_file.download_to_drive(download_path)
     except Exception as e:
         await progress_msg.edit_text(f"❌ Download failed: `{str(e)[:200]}`")
         clear_workflow(user_id)
@@ -475,9 +453,9 @@ async def on_file_received(client: Client, message: Message) -> None:
     info = await get_media_info(download_path)
     if info:
         info_text = format_media_info(info)
-        await message.reply_text(info_text)
+        await message.reply_text(info_text, parse_mode="Markdown")
 
-    # Create and queue the task
+    # Queue the task
     task_type = TaskType.ENCODE if wf["type"] == "encode" else TaskType.UPSCALE
     is_admin = user_id in Config.ADMIN_IDS
 
@@ -488,12 +466,16 @@ async def on_file_received(client: Client, message: Message) -> None:
         input_file=download_path,
         settings=wf,
         priority=10 if is_admin else 0,
-        progress_message_id=progress_msg.id,
-        progress_chat_id=message.chat.id,
+        progress_message_id=progress_msg.message_id,
+        progress_chat_id=message.chat_id,
     )
 
-    await queue_manager.add_task(task)
-    position = await db.get_queue_position(task.task_id)
+    try:
+        await queue_manager.add_task(task)
+        position = await db.get_queue_position(task.task_id)
+    except Exception as e:
+        logger.error("Failed to queue task: %s", e)
+        position = 1
 
     await progress_msg.edit_text(
         f"✅ **Task Queued**\n\n"
@@ -503,134 +485,264 @@ async def on_file_received(client: Client, message: Message) -> None:
         f"Use /status to check progress or /cancel to abort."
     )
 
-    # Log to channel
-    if Config.LOG_CHANNEL:
+    clear_workflow(user_id)
+
+
+# ── Task Processor ────────────────────────────────────────────────────
+
+async def process_task(task: Task, app: Application) -> None:
+    """Process an encoding or upscaling task."""
+    chat_id = task.progress_chat_id
+    msg_id = task.progress_message_id
+    input_file = task.input_file
+    output_file = ""
+
+    try:
+        if task.task_type == TaskType.ENCODE:
+            await app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text="⚙️ **Encoding...**\n\n⏳ Starting up...",
+            )
+            output_file = await _process_encode(task, app)
+        else:
+            await app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text="🔍 **Upscaling...**\n\n⏳ Starting up...",
+            )
+            output_file = await _process_upscale(task, app)
+
+        if output_file and Path(output_file).exists():
+            await _upload_result(task, output_file, app)
+        else:
+            raise RuntimeError("Processing produced no output file")
+
+    except asyncio.CancelledError:
+        await app.bot.send_message(chat_id, "❌ Task cancelled.")
+        raise
+    except Exception as e:
+        logger.error("Task %s failed: %s\n%s", task.task_id, e, traceback.format_exc())
+        await app.bot.send_message(
+            chat_id,
+            f"❌ **Task Failed**\n\n`{str(e)[:500]}`\n\nTask ID: `{task.task_id}`",
+        )
+        raise
+    finally:
+        cleanup_files(input_file)
+        if output_file:
+            cleanup_files(output_file)
+
+
+async def _process_encode(task: Task, app: Application) -> str:
+    """Run encoding."""
+    settings = EncodeSettings(
+        codec=task.settings.get("codec", Config.DEFAULT_CODEC),
+        quality=task.settings.get("quality", "medium"),
+        preset=task.settings.get("preset", "medium"),
+        audio_codec=task.settings.get("audio", "copy"),
+        use_gpu=Config.GPU_ENABLED,
+    )
+
+    async def on_progress(current: float, total: float) -> None:
+        percent = (current / total * 100) if total > 0 else 0
         try:
-            await app.send_message(
-                Config.LOG_CHANNEL,
-                f"📋 New task queued\n"
-                f"👤 User: `{user_id}` (@{message.from_user.username or 'N/A'})\n"
-                f"📋 Type: `{task_type.value}`\n"
-                f"💾 Size: `{human_size(file_size)}`\n"
-                f"🆔 Task: `{task.task_id}`",
+            await app.bot.edit_message_text(
+                chat_id=task.progress_chat_id,
+                message_id=task.progress_message_id,
+                text=f"⚙️ **Encoding...**\n\n📊 Progress: `{percent:.1f}%`",
             )
         except Exception:
             pass
 
+    return await encoder.encode(
+        input_path=task.input_file,
+        settings=settings,
+        progress_callback=on_progress,
+    )
 
-# ── Startup & Shutdown ────────────────────────────────────────────────
 
-async def on_startup() -> None:
-    """Initialize services on bot startup."""
+async def _process_upscale(task: Task, app: Application) -> str:
+    """Run upscaling."""
+    resolution = task.settings.get("resolution", "4k")
+
+    async def on_progress(current: int, total: int) -> None:
+        percent = (current / total * 100) if total > 0 else 0
+        try:
+            await app.bot.edit_message_text(
+                chat_id=task.progress_chat_id,
+                message_id=task.progress_message_id,
+                text=f"🔍 **Upscaling to {resolution.upper()}**\n\n"
+                     f"🖼 Frames: `{current}/{total}`\n"
+                     f"📊 Progress: `{percent:.1f}%`",
+            )
+        except Exception:
+            pass
+
+    return await upscaler.upscale(
+        input_path=task.input_file,
+        target_resolution=resolution,
+        progress_callback=on_progress,
+    )
+
+
+async def _upload_result(task: Task, output_path: str, app: Application) -> None:
+    """Upload result to Telegram or GDrive."""
+    chat_id = task.progress_chat_id
+    file_size = Path(output_path).stat().st_size
+    task_label = "Encoding" if task.task_type == TaskType.ENCODE else "Upscaling"
+
+    info = await get_media_info(output_path)
+    info_lines = ""
+    if info and info.get("video"):
+        v = info["video"]
+        info_lines = f"\n📐 Resolution: `{v['width']}×{v['height']}`\n🎬 Codec: `{v['codec']}`"
+
+    if file_size <= Config.TG_UPLOAD_LIMIT:
+        caption = (
+            f"✅ **{task_label} Complete!**\n\n"
+            f"💾 Size: `{human_size(file_size)}`\n"
+            f"🆔 Task: `{task.task_id}`{info_lines}"
+        )
+        await app.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=task.progress_message_id,
+            text=f"📤 **Uploading to Telegram...**\n\n💾 `{human_size(file_size)}`",
+        )
+        try:
+            await app.bot.send_document(
+                chat_id=chat_id,
+                document=open(output_path, "rb"),
+                caption=caption,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error("Telegram upload failed: %s", e)
+            await _upload_to_gdrive(task, output_path, file_size, task_label, info_lines, app)
+    else:
+        await _upload_to_gdrive(task, output_path, file_size, task_label, info_lines, app)
+
+
+async def _upload_to_gdrive(task, output_path, file_size, task_label, info_lines, app) -> None:
+    """Upload to Google Drive."""
+    chat_id = task.progress_chat_id
+
+    if not gdrive.is_configured():
+        await app.bot.send_message(
+            chat_id,
+            f"❌ **File too large** (`{human_size(file_size)}`)\n\n"
+            "Google Drive is not configured.",
+        )
+        return
+
+    await app.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=task.progress_message_id,
+        text=f"📤 **Uploading to Google Drive...**\n\n💾 `{human_size(file_size)}`",
+    )
+
+    try:
+        result = await gdrive.upload(file_path=output_path, filename=Path(output_path).name)
+        await app.bot.send_message(
+            chat_id,
+            f"✅ **{task_label} Complete!**\n\n"
+            f"💾 Size: `{human_size(file_size)}`\n"
+            f"🆔 Task: `{task.task_id}`{info_lines}\n\n"
+            f"📁 **Google Drive Link:**\n{result['link']}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error("GDrive upload failed: %s", e)
+        await app.bot.send_message(chat_id, f"❌ **GDrive upload failed**\n\n`{str(e)[:300]}`")
+
+
+# ── Startup ───────────────────────────────────────────────────────────
+
+async def on_startup(app: Application) -> None:
+    """Initialize services."""
     logger.info("=" * 60)
     logger.info("AnimeEncoderBot starting up...")
     logger.info("=" * 60)
 
-    # Connect to MongoDB (non-fatal — bot can still respond to basic commands)
+    # MongoDB (non-fatal)
     try:
         await db.connect()
     except Exception as e:
-        logger.error("⚠️ MongoDB connection FAILED: %s — bot will work but tasks/stats won't persist", e)
+        logger.error("MongoDB connection FAILED: %s — bot will work but tasks won't persist", e)
 
-    # Initialize encoder (GPU detection + verification)
+    # Encoder
     await encoder.initialize()
     logger.info("GPU: %s | HEVC NVENC: %s | AV1 NVENC: %s",
                 encoder.gpu_name, encoder.gpu_available, encoder.has_av1_nvenc)
 
-    # Verify GPU actually works (not just detected)
-    if encoder.gpu_available:
-        from utils import verify_gpu_encoding
-        gpu_works = await verify_gpu_encoding([])
-        if not gpu_works:
-            logger.error("⚠️ GPU detected but NVENC test FAILED — encoding may fall back to CPU")
+    # Upscaler
+    await upscaler.check_available()
+    logger.info("Real-ESRGAN: %s", "available" if upscaler._available else "NOT FOUND")
 
-    # Check upscaler
-    upscaler_ok = await upscaler.check_available()
-    logger.info("Real-ESRGAN: %s", "available" if upscaler_ok else "NOT FOUND")
-
-    # Check GDrive
+    # GDrive
     gdrive_ok = gdrive.is_configured()
-    logger.info("Google Drive: %s", "configured" if gdrive_ok else "not configured (files >2GB won't upload)")
+    logger.info("Google Drive: %s", "configured" if gdrive_ok else "not configured")
 
-    # Start queue manager
-    queue_manager.set_processor(process_task)
-    await queue_manager.start()
+    # Notify admins
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            await app.bot.send_message(
+                admin_id,
+                f"🟢 **Bot Online!**\n\n"
+                f"🤖 @{(await app.bot.get_me()).username} is ready.\n"
+                f"🖥 GPU: {encoder.gpu_name if encoder.gpu_available else 'CPU mode'}\n"
+                f"⏰ Send /start to begin!",
+            )
+        except Exception:
+            pass
 
     logger.info("Bot is ready!")
 
 
-async def on_shutdown() -> None:
+async def on_shutdown(app: Application) -> None:
     """Clean shutdown."""
     logger.info("Shutting down...")
-    await queue_manager.stop()
-    await db.close()
+    try:
+        await db.close()
+    except Exception:
+        pass
     logger.info("Goodbye!")
 
 
 # ── Main ──────────────────────────────────────────────────────────────
 
-async def main() -> None:
-    """Main async entry point."""
-    # Register handlers FIRST
-    register_commands(app)
-    register_callbacks(app)
+def main() -> None:
+    """Main entry point."""
+    # Validate config
+    errors = Config.validate()
+    if errors:
+        for err in errors:
+            logger.error("Config error: %s", err)
+        sys.exit(1)
 
-    # Debug: catch-all handler to verify messages are being received
-    @app.on_message(group=999)
-    async def debug_handler(client, message):
-        logger.info(
-            "📨 RAW MESSAGE RECEIVED: chat=%s user=%s text=%s",
-            message.chat.id,
-            getattr(message.from_user, 'id', '?'),
-            (message.text or '')[:50],
-        )
+    Config.ensure_dirs()
 
-    await on_startup()
+    # Build application
+    app = Application.builder().token(Config.BOT_TOKEN).build()
 
-    try:
-        await app.start()
-        me = await app.get_me()
-        logger.info("Bot started as @%s", me.username)
-        logger.info("Registered %d handler groups", len(app.dispatcher.groups))
-        for group_id, handlers in app.dispatcher.groups.items():
-            logger.info("  Group %d: %d handlers", group_id, len(handlers))
+    # Register handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("encode", cmd_encode))
+    app.add_handler(CommandHandler("upscale", cmd_upscale))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_file))
 
-        # Self-test: send a ping to admins
-        for admin_id in Config.ADMIN_IDS:
-            try:
-                await app.send_message(
-                    admin_id,
-                    f"🟢 **Bot Online!**\n\n"
-                    f"🤖 @{me.username} is ready.\n"
-                    f"🖥 GPU: {encoder.gpu_name if encoder.gpu_available else 'CPU mode'}\n"
-                    f"📝 Handlers: {sum(len(h) for h in app.dispatcher.groups.values())} registered\n"
-                    f"⏰ Send /start to begin!",
-                )
-            except Exception as e:
-                logger.error("Failed to send admin ping: %s", e)
+    # Startup/shutdown hooks
+    app.post_init = on_startup
+    app.post_shutdown = on_shutdown
 
-        # Notify log channel
-        if Config.LOG_CHANNEL:
-            try:
-                gpu_status = f"GPU: {encoder.gpu_name}" if encoder.gpu_available else "GPU: None (CPU mode)"
-                gdrive_status = "✅ Configured" if gdrive.is_configured() else "❌ Not configured"
-                await app.send_message(
-                    Config.LOG_CHANNEL,
-                    f"🟢 **Bot Started**\n\n"
-                    f"🖥 {gpu_status}\n"
-                    f"📁 GDrive: {gdrive_status}\n"
-                    f"🔧 Workers: {Config.CONCURRENT_TASKS}\n"
-                    f"📦 Max file: {human_size(Config.MAX_FILE_SIZE)}",
-                )
-            except Exception:
-                pass
-
-        logger.info("Bot is now listening for messages...")
-        await idle()
-    finally:
-        await on_shutdown()
-        await app.stop()
+    logger.info("Starting bot with python-telegram-bot (Bot API)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

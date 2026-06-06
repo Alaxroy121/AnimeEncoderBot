@@ -1,9 +1,8 @@
 # AnimeEncoderBot - Python Dependencies
 # Install: pip install -r requirements.txt
 
-# Telegram Bot Framework (async)
-pyrogram>=2.0.106
-tgcrypto>=1.2.5
+# Telegram Bot Framework (Bot API - more reliable than MTProto)
+python-telegram-bot>=21.0
 
 # MongoDB async driver
 motor>=3.3.0

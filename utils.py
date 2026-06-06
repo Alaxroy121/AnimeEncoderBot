@@ -305,10 +305,10 @@ async def verify_gpu_encoding(test_cmd: list[str]) -> bool:
     Call during startup to confirm GPU isn't just detected but functional.
     """
     try:
-        # Generate a tiny test: 1 frame, encode with NVENC
+        # Generate a small test: 1 frame at 256x256 (above NVENC minimum of 129x33)
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+            "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
             "-c:v", "hevc_nvenc", "-preset", "p1",
             "-f", "null", "-",
         ]

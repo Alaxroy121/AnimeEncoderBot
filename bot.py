@@ -568,9 +568,19 @@ async def on_shutdown() -> None:
 
 async def main() -> None:
     """Main async entry point."""
-    # Register handlers
+    # Register handlers FIRST
     register_commands(app)
     register_callbacks(app)
+
+    # Debug: catch-all handler to verify messages are being received
+    @app.on_message(group=999)
+    async def debug_handler(client, message):
+        logger.info(
+            "📨 RAW MESSAGE RECEIVED: chat=%s user=%s text=%s",
+            message.chat.id,
+            getattr(message.from_user, 'id', '?'),
+            (message.text or '')[:50],
+        )
 
     await on_startup()
 
@@ -578,8 +588,11 @@ async def main() -> None:
         await app.start()
         me = await app.get_me()
         logger.info("Bot started as @%s", me.username)
+        logger.info("Registered %d handler groups", len(app.dispatcher.groups))
+        for group_id, handlers in app.dispatcher.groups.items():
+            logger.info("  Group %d: %d handlers", group_id, len(handlers))
 
-        # Self-test: send a ping to admins so they know bot is alive
+        # Self-test: send a ping to admins
         for admin_id in Config.ADMIN_IDS:
             try:
                 await app.send_message(
@@ -587,10 +600,11 @@ async def main() -> None:
                     f"🟢 **Bot Online!**\n\n"
                     f"🤖 @{me.username} is ready.\n"
                     f"🖥 GPU: {encoder.gpu_name if encoder.gpu_available else 'CPU mode'}\n"
+                    f"📝 Handlers: {sum(len(h) for h in app.dispatcher.groups.values())} registered\n"
                     f"⏰ Send /start to begin!",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to send admin ping: %s", e)
 
         # Notify log channel
         if Config.LOG_CHANNEL:
@@ -608,6 +622,7 @@ async def main() -> None:
             except Exception:
                 pass
 
+        logger.info("Bot is now listening for messages...")
         await idle()
     finally:
         await on_shutdown()

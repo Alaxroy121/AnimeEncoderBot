@@ -29,6 +29,7 @@ class TaskStatus(str, Enum):
 class TaskType(str, Enum):
     ENCODE = "encode"
     UPSCALE = "upscale"
+    UPSCALE_ENCODE = "upscale_encode"  # Combined: upscale then encode
 
 
 @dataclass

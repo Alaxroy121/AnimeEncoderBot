@@ -118,15 +118,26 @@ def audio_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
     ])
 
-def resolution_keyboard() -> InlineKeyboardMarkup:
+def resolution_keyboard(include_encode: bool = False) -> InlineKeyboardMarkup:
+    prefix = "upenc_res_" if include_encode else "res_"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📺 1080p (FHD)", callback_data="res_1080p"),
-            InlineKeyboardButton("🖥 2K (QHD)", callback_data="res_2k"),
+            InlineKeyboardButton("📺 1080p (FHD)", callback_data=f"{prefix}1080p"),
+            InlineKeyboardButton("🖥 2K (QHD)", callback_data=f"{prefix}2k"),
         ],
         [
-            InlineKeyboardButton("📽 4K (UHD)", callback_data="res_4k"),
-            InlineKeyboardButton("🎬 8K (FUHD)", callback_data="res_8k"),
+            InlineKeyboardButton("📽 4K (UHD)", callback_data=f"{prefix}4k"),
+            InlineKeyboardButton("🎬 8K (FUHD)", callback_data=f"{prefix}8k"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
+    ])
+
+
+def upscale_encode_codec_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 AV1 (Best quality)", callback_data="upenc_codec_av1"),
+            InlineKeyboardButton("🎬 HEVC (Faster)", callback_data="upenc_codec_hevc"),
         ],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
     ])
@@ -190,6 +201,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "│   Choose resolution → send video\n"
         "│   Targets: 1080p, 2K, 4K, 8K\n"
         "│   Model: Real-ESRGAN Anime V3\n\n"
+        "**Combined Commands**\n"
+        "├ /upscale\\_encode (or /ue) — Upscale + Encode\n"
+        "│   First upscales with AI, then encodes\n"
+        "│   Best for maximum quality!\n\n"
         "**General Commands**\n"
         "├ /status — Check your current task\n"
         "├ /cancel — Cancel your active task\n"
@@ -246,6 +261,37 @@ async def cmd_upscale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Using **Real-ESRGAN Anime V3** model.\n\n"
         "Choose target resolution:",
         reply_markup=resolution_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_upscale_encode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start combined upscale + encode workflow."""
+    user_id = update.effective_user.id
+
+    try:
+        if await db.is_banned(user_id):
+            await update.message.reply_text("🚫 You are banned.")
+            return
+    except Exception:
+        pass
+
+    if not upscaler._available:
+        await update.message.reply_text(
+            "❌ **Upscaler Not Available**\n\n"
+            "Real-ESRGAN is not installed on this server."
+        )
+        return
+
+    set_workflow(user_id, {"type": "upscale_encode", "awaiting_file": False})
+
+    await update.message.reply_text(
+        "🔍🎬 **Upscale + Encode**\n\n"
+        "This will:\n"
+        "1️⃣ Upscale with Real-ESRGAN (Anime V3)\n"
+        "2️⃣ Encode with your chosen codec\n\n"
+        "Choose target resolution:",
+        reply_markup=resolution_keyboard(include_encode=True),
         parse_mode="Markdown",
     )
 
@@ -385,6 +431,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="Markdown",
         )
 
+    # ── Upscale + Encode flow ──
+    elif data.startswith("upenc_res_"):
+        wf["resolution"] = data.replace("upenc_res_", "")
+        set_workflow(user_id, wf)
+        res_labels = {"1080p": "1920×1080", "2k": "2560×1440", "4k": "3840×2160", "8k": "7680×4320"}
+        await query.message.edit_text(
+            f"🔍🎬 **Upscale + Encode**\n\n"
+            f"📐 Resolution: **{wf['resolution'].upper()}** ({res_labels.get(wf['resolution'], '')})\n\n"
+            f"Now choose encoding codec:",
+            reply_markup=upscale_encode_codec_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("upenc_codec_"):
+        wf["codec"] = data.replace("upenc_codec_", "")
+        wf["quality"] = "high"  # Default to high quality for upscaled content
+        wf["preset"] = "medium"
+        wf["audio"] = "copy"
+        wf["awaiting_file"] = True
+        set_workflow(user_id, wf)
+        res_labels = {"1080p": "1920×1080", "2k": "2560×1440", "4k": "3840×2160", "8k": "7680×4320"}
+        await query.message.edit_text(
+            f"🔍🎬 **Upscale + Encode Settings**\n\n"
+            f"📐 Resolution: **{wf['resolution'].upper()}** ({res_labels.get(wf['resolution'], '')})\n"
+            f"🎬 Codec: **{wf['codec'].upper()}**\n"
+            f"✨ Quality: **High**\n"
+            f"🤖 Model: **Real-ESRGAN (Anime V3)**\n\n"
+            f"✅ **Now send your video file!**",
+            parse_mode="Markdown",
+        )
+
 
 # ── File Handler ──────────────────────────────────────────────────────
 
@@ -456,7 +533,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(info_text, parse_mode="Markdown")
 
     # Queue the task
-    task_type = TaskType.ENCODE if wf["type"] == "encode" else TaskType.UPSCALE
+    if wf["type"] == "encode":
+        task_type = TaskType.ENCODE
+    elif wf["type"] == "upscale_encode":
+        task_type = TaskType.UPSCALE_ENCODE
+    else:
+        task_type = TaskType.UPSCALE
     is_admin = user_id in Config.ADMIN_IDS
 
     task = Task(
@@ -505,6 +587,13 @@ async def process_task(task: Task, app: Application) -> None:
                 text="⚙️ **Encoding...**\n\n⏳ Starting up...",
             )
             output_file = await _process_encode(task, app)
+        elif task.task_type == TaskType.UPSCALE_ENCODE:
+            await app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text="🔍🎬 **Upscale + Encode**\n\n⏳ Step 1: Upscaling...",
+            )
+            output_file = await _process_upscale_encode(task, app)
         else:
             await app.bot.edit_message_text(
                 chat_id=chat_id,
@@ -584,6 +673,77 @@ async def _process_upscale(task: Task, app: Application) -> str:
         target_resolution=resolution,
         progress_callback=on_progress,
     )
+
+
+async def _process_upscale_encode(task: Task, app: Application) -> str:
+    """Run upscaling then encoding (combined workflow)."""
+    resolution = task.settings.get("resolution", "4k")
+    
+    # Step 1: Upscale
+    async def on_upscale_progress(current: int, total: int) -> None:
+        percent = (current / total * 100) if total > 0 else 0
+        try:
+            await app.bot.edit_message_text(
+                chat_id=task.progress_chat_id,
+                message_id=task.progress_message_id,
+                text=f"🔍🎬 **Upscale + Encode**\n\n"
+                     f"**Step 1: Upscaling to {resolution.upper()}**\n"
+                     f"🖼 Frames: `{current}/{total}`\n"
+                     f"📊 Progress: `{percent:.1f}%`",
+            )
+        except Exception:
+            pass
+
+    upscaled_path = await upscaler.upscale(
+        input_path=task.input_file,
+        target_resolution=resolution,
+        progress_callback=on_upscale_progress,
+    )
+
+    # Step 2: Encode the upscaled video
+    try:
+        await app.bot.edit_message_text(
+            chat_id=task.progress_chat_id,
+            message_id=task.progress_message_id,
+            text=f"🔍🎬 **Upscale + Encode**\n\n"
+                 f"✅ Upscaling complete!\n\n"
+                 f"**Step 2: Encoding with {task.settings.get('codec', 'hevc').upper()}...**",
+        )
+    except Exception:
+        pass
+
+    settings = EncodeSettings(
+        codec=task.settings.get("codec", "hevc"),
+        quality=task.settings.get("quality", "high"),
+        preset=task.settings.get("preset", "medium"),
+        audio_codec=task.settings.get("audio", "copy"),
+        use_gpu=Config.GPU_ENABLED,
+    )
+
+    async def on_encode_progress(current: float, total: float) -> None:
+        percent = (current / total * 100) if total > 0 else 0
+        try:
+            await app.bot.edit_message_text(
+                chat_id=task.progress_chat_id,
+                message_id=task.progress_message_id,
+                text=f"🔍🎬 **Upscale + Encode**\n\n"
+                     f"✅ Upscaling complete!\n\n"
+                     f"**Step 2: Encoding with {settings.codec.upper()}**\n"
+                     f"📊 Progress: `{percent:.1f}%`",
+            )
+        except Exception:
+            pass
+
+    encoded_path = await encoder.encode(
+        input_path=upscaled_path,
+        settings=settings,
+        progress_callback=on_encode_progress,
+    )
+
+    # Cleanup intermediate upscaled file
+    cleanup_files(upscaled_path)
+
+    return encoded_path
 
 
 async def _upload_result(task: Task, output_path: str, app: Application) -> None:
@@ -730,6 +890,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("encode", cmd_encode))
     app.add_handler(CommandHandler("upscale", cmd_upscale))
+    app.add_handler(CommandHandler("upscale_encode", cmd_upscale_encode))
+    app.add_handler(CommandHandler("ue", cmd_upscale_encode))  # Short alias
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("queue", cmd_queue))

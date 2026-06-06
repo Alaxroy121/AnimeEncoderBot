@@ -4,8 +4,10 @@ All /slash commands are defined and registered here.
 """
 
 import asyncio
+import functools
 import logging
 import random
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,11 +35,34 @@ logger = logging.getLogger(__name__)
 
 def admin_only(func):
     """Decorator to restrict a command to admin users."""
+    @functools.wraps(func)
     async def wrapper(client: Client, message: Message):
         if message.from_user.id not in Config.ADMIN_IDS:
             await message.reply_text("🚫 This command is for admins only.")
             return
         return await func(client, message)
+    return wrapper
+
+
+def safe_handler(func):
+    """Decorator to catch and log all errors in handlers.
+    Prevents silent crashes that make the bot seem unresponsive.
+    """
+    @functools.wraps(func)
+    async def wrapper(client: Client, message: Message):
+        try:
+            return await func(client, message)
+        except Exception as e:
+            logger.error(
+                "Handler %s crashed: %s\n%s",
+                func.__name__, e, traceback.format_exc(),
+            )
+            try:
+                await message.reply_text(
+                    f"⚠️ Something went wrong: `{str(e)[:200]}`"
+                )
+            except Exception:
+                pass
     return wrapper
 
 
@@ -59,10 +84,14 @@ def register_commands(app: Client) -> None:
     # ── /start ──
 
     @app.on_message(filters.command("start") & filters.private)
+    @safe_handler
     async def cmd_start(client: Client, message: Message) -> None:
         """Welcome message with anime waifu image."""
         user = message.from_user
-        await db.add_user(user.id, user.username or "")
+        try:
+            await db.add_user(user.id, user.username or "")
+        except Exception as e:
+            logger.warning("DB add_user failed (non-fatal): %s", e)
 
         gpu_status = f"✅ {encoder.gpu_name}" if encoder.gpu_available else "❌ CPU mode"
         upscaler_status = "✅ Available" if await upscaler.check_available() else "❌ Not installed"
@@ -101,6 +130,7 @@ def register_commands(app: Client) -> None:
     # ── /help ──
 
     @app.on_message(filters.command("help") & filters.private)
+    @safe_handler
     async def cmd_help(client: Client, message: Message) -> None:
         """Detailed help."""
         await message.reply_text(
@@ -141,6 +171,7 @@ def register_commands(app: Client) -> None:
     # ── /encode ──
 
     @app.on_message(filters.command("encode") & filters.private)
+    @safe_handler
     async def cmd_encode(client: Client, message: Message) -> None:
         """Start encoding workflow."""
         user_id = message.from_user.id
@@ -170,6 +201,7 @@ def register_commands(app: Client) -> None:
     # ── /upscale ──
 
     @app.on_message(filters.command("upscale") & filters.private)
+    @safe_handler
     async def cmd_upscale(client: Client, message: Message) -> None:
         """Start upscaling workflow."""
         user_id = message.from_user.id
@@ -207,6 +239,7 @@ def register_commands(app: Client) -> None:
     # ── /status ──
 
     @app.on_message(filters.command("status") & filters.private)
+    @safe_handler
     async def cmd_status(client: Client, message: Message) -> None:
         """Check current task status."""
         user_id = message.from_user.id
@@ -252,6 +285,7 @@ def register_commands(app: Client) -> None:
     # ── /cancel ──
 
     @app.on_message(filters.command("cancel") & filters.private)
+    @safe_handler
     async def cmd_cancel(client: Client, message: Message) -> None:
         """Cancel active task."""
         user_id = message.from_user.id
@@ -277,6 +311,7 @@ def register_commands(app: Client) -> None:
     # ── /settings ──
 
     @app.on_message(filters.command("settings") & filters.private)
+    @safe_handler
     async def cmd_settings(client: Client, message: Message) -> None:
         """Show and manage user settings."""
         user_id = message.from_user.id
@@ -299,6 +334,7 @@ def register_commands(app: Client) -> None:
     # ── /queue ──
 
     @app.on_message(filters.command("queue") & filters.private)
+    @safe_handler
     async def cmd_queue(client: Client, message: Message) -> None:
         """Show the task queue."""
         info = await queue_manager.get_queue_info()

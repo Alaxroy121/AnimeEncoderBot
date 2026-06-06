@@ -526,8 +526,11 @@ async def on_startup() -> None:
     logger.info("AnimeEncoderBot starting up...")
     logger.info("=" * 60)
 
-    # Connect to MongoDB
-    await db.connect()
+    # Connect to MongoDB (non-fatal — bot can still respond to basic commands)
+    try:
+        await db.connect()
+    except Exception as e:
+        logger.error("⚠️ MongoDB connection FAILED: %s — bot will work but tasks/stats won't persist", e)
 
     # Initialize encoder (GPU detection + verification)
     await encoder.initialize()

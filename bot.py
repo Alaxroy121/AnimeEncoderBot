@@ -58,12 +58,21 @@ def create_app() -> Client:
 
     Config.ensure_dirs()
 
+    # Remove stale session files that can block Pyrogram from connecting
+    session_file = Path(__file__).parent / "AnimeEncoderBot.session"
+    session_journal = Path(__file__).parent / "AnimeEncoderBot.session-journal"
+    for sf in [session_file, session_journal]:
+        if sf.exists():
+            sf.unlink()
+            logger.info("Removed stale session file: %s", sf)
+
     app = Client(
         name="AnimeEncoderBot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workdir=str(Path(__file__).parent),
+        in_memory=True,  # Don't persist session to disk — avoids session conflicts
     )
     return app
 
@@ -567,7 +576,21 @@ async def main() -> None:
 
     try:
         await app.start()
-        logger.info("Bot started as @%s", (await app.get_me()).username)
+        me = await app.get_me()
+        logger.info("Bot started as @%s", me.username)
+
+        # Self-test: send a ping to admins so they know bot is alive
+        for admin_id in Config.ADMIN_IDS:
+            try:
+                await app.send_message(
+                    admin_id,
+                    f"🟢 **Bot Online!**\n\n"
+                    f"🤖 @{me.username} is ready.\n"
+                    f"🖥 GPU: {encoder.gpu_name if encoder.gpu_available else 'CPU mode'}\n"
+                    f"⏰ Send /start to begin!",
+                )
+            except Exception:
+                pass
 
         # Notify log channel
         if Config.LOG_CHANNEL:

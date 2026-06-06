@@ -270,7 +270,7 @@ async def detect_nvidia_gpu() -> Optional[str]:
 
 
 async def check_nvenc_support() -> bool:
-    """Check if FFmpeg has NVENC support."""
+    """Check if FFmpeg has HEVC NVENC support."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-encoders",
@@ -281,4 +281,49 @@ async def check_nvenc_support() -> bool:
         output = stdout.decode()
         return "hevc_nvenc" in output
     except Exception:
+        return False
+
+
+async def check_av1_nvenc_support() -> bool:
+    """Check if FFmpeg has AV1 NVENC support (RTX 40xx+ GPUs)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-encoders",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode()
+        return "av1_nvenc" in output
+    except Exception:
+        return False
+
+
+async def verify_gpu_encoding(test_cmd: list[str]) -> bool:
+    """Run a quick GPU encode test to verify NVENC actually works.
+    
+    Call during startup to confirm GPU isn't just detected but functional.
+    """
+    try:
+        # Generate a tiny test: 1 frame, encode with NVENC
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+            "-c:v", "hevc_nvenc", "-preset", "p1",
+            "-f", "null", "-",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            logger.info("✅ GPU encode test PASSED — NVENC is functional")
+            return True
+        else:
+            logger.warning("❌ GPU encode test FAILED: %s", stderr.decode()[:200])
+            return False
+    except Exception as e:
+        logger.warning("❌ GPU encode test error: %s", e)
         return False

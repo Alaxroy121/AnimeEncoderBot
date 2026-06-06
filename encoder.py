@@ -1,7 +1,8 @@
 """
 FFmpeg encoding engine for AnimeEncoderBot.
-Supports AV1 (SVT-AV1) and H.265/HEVC (NVENC + CPU fallback).
-Optimized for NVIDIA T4 and other NVIDIA GPUs.
+Supports AV1 and H.265/HEVC with NVIDIA GPU acceleration.
+GPU-FIRST: Always uses GPU when available. CPU is a last resort.
+Optimized for NVIDIA T4, P100, and other NVIDIA GPUs.
 """
 
 import asyncio
@@ -12,13 +13,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from utils import detect_nvidia_gpu, check_nvenc_support, get_output_path
+from utils import detect_nvidia_gpu, check_nvenc_support, check_av1_nvenc_support, get_output_path
 
 logger = logging.getLogger(__name__)
 
 # ── Quality / Preset Maps ────────────────────────────────────────────
 
-# CRF/CQ values per quality tier (lower = better quality, larger file)
 QUALITY_MAP = {
     "low":    {"hevc_crf": 30, "hevc_cq": 32, "av1_crf": 38, "av1_cq": 38},
     "medium": {"hevc_crf": 24, "hevc_cq": 26, "av1_crf": 30, "av1_cq": 30},
@@ -26,12 +26,19 @@ QUALITY_MAP = {
     "ultra":  {"hevc_crf": 16, "hevc_cq": 18, "av1_crf": 18, "av1_cq": 18},
 }
 
-# FFmpeg preset names per codec
+# NVENC presets (P1-P7, higher = slower + better quality)
 HEVC_NVENC_PRESETS = {
-    "fast": "p4",        # NVENC P4 — fast
-    "medium": "p5",      # NVENC P5 — balanced
-    "slow": "p6",        # NVENC P6 — quality
-    "veryslow": "p7",    # NVENC P7 — max quality
+    "fast": "p4",
+    "medium": "p5",
+    "slow": "p6",
+    "veryslow": "p7",
+}
+
+AV1_NVENC_PRESETS = {
+    "fast": "p4",
+    "medium": "p5",
+    "slow": "p6",
+    "veryslow": "p7",
 }
 
 HEVC_CPU_PRESETS = {
@@ -42,58 +49,84 @@ HEVC_CPU_PRESETS = {
 }
 
 SVT_AV1_PRESETS = {
-    "fast": "8",         # SVT-AV1 preset 8 — fast
-    "medium": "6",       # SVT-AV1 preset 6 — balanced
-    "slow": "4",         # SVT-AV1 preset 4 — quality
-    "veryslow": "2",     # SVT-AV1 preset 2 — max quality (very slow)
+    "fast": "8",
+    "medium": "6",
+    "slow": "4",
+    "veryslow": "2",
 }
 
 
 @dataclass
 class EncodeSettings:
     """Encoding parameters."""
-    codec: str = "hevc"             # hevc or av1
-    quality: str = "medium"         # low, medium, high, ultra
-    preset: str = "medium"          # fast, medium, slow, veryslow
-    audio_codec: str = "copy"       # copy, aac, opus
+    codec: str = "hevc"
+    quality: str = "medium"
+    preset: str = "medium"
+    audio_codec: str = "copy"
     audio_bitrate: str = "192k"
-    subtitle_mode: str = "copy"     # copy, burn, none
+    subtitle_mode: str = "copy"
     use_gpu: bool = True
-    resolution: Optional[str] = None  # None = keep original, or "1920x1080" etc.
+    resolution: Optional[str] = None
     extra_flags: list[str] = field(default_factory=list)
 
 
 class Encoder:
-    """FFmpeg encoding engine with GPU acceleration."""
+    """FFmpeg encoding engine — GPU-first, CPU fallback."""
 
     def __init__(self) -> None:
         self._gpu_name: Optional[str] = None
-        self._has_nvenc: bool = False
+        self._has_hevc_nvenc: bool = False
+        self._has_av1_nvenc: bool = False
+        self._has_cuda_decode: bool = False
         self._initialized: bool = False
 
     async def initialize(self) -> None:
-        """Detect GPU and NVENC capabilities."""
+        """Detect GPU and all NVENC capabilities."""
         if self._initialized:
             return
+
         self._gpu_name = await detect_nvidia_gpu()
         if self._gpu_name:
-            self._has_nvenc = await check_nvenc_support()
+            self._has_hevc_nvenc = await check_nvenc_support()
+            self._has_av1_nvenc = await check_av1_nvenc_support()
+            self._has_cuda_decode = await self._check_cuda_decode()
+
             logger.info(
-                "GPU: %s | NVENC: %s",
+                "GPU: %s | HEVC NVENC: %s | AV1 NVENC: %s | CUDA decode: %s",
                 self._gpu_name,
-                "available" if self._has_nvenc else "not available",
+                "YES" if self._has_hevc_nvenc else "NO",
+                "YES" if self._has_av1_nvenc else "NO",
+                "YES" if self._has_cuda_decode else "NO",
             )
         else:
-            logger.info("No NVIDIA GPU detected — using CPU encoding")
+            logger.warning("No NVIDIA GPU detected — ALL encoding will use CPU (slow!)")
+
         self._initialized = True
+
+    async def _check_cuda_decode(self) -> bool:
+        """Check if FFmpeg supports CUDA hardware decoding."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-hwaccels",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            return "cuda" in stdout.decode()
+        except Exception:
+            return False
 
     @property
     def gpu_available(self) -> bool:
-        return self._has_nvenc and self._gpu_name is not None
+        return self._has_hevc_nvenc and self._gpu_name is not None
 
     @property
     def gpu_name(self) -> str:
         return self._gpu_name or "None"
+
+    @property
+    def has_av1_nvenc(self) -> bool:
+        return self._has_av1_nvenc
 
     def _build_command(
         self,
@@ -101,33 +134,47 @@ class Encoder:
         output_path: str,
         settings: EncodeSettings,
     ) -> list[str]:
-        """Build the full FFmpeg command."""
-        cmd: list[str] = ["ffmpeg", "-y", "-hide_banner"]
+        """Build the full FFmpeg command. GPU-first approach."""
+        cmd: list[str] = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
 
-        # Hardware decode if using GPU
-        use_gpu = settings.use_gpu and self.gpu_available
-        if use_gpu:
-            cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+        use_gpu = settings.use_gpu and self._gpu_name is not None
+
+        # ── Hardware-accelerated decoding ──
+        # Use cuvid/cuda decoder to keep frames on GPU memory
+        if use_gpu and self._has_cuda_decode:
+            cmd.extend(["-hwaccel", "cuda"])
+            # Only keep on GPU surface if we're encoding with NVENC
+            # (not SVT-AV1 which needs CPU frames)
+            if self._can_use_nvenc_for(settings.codec):
+                cmd.extend(["-hwaccel_output_format", "cuda"])
 
         cmd.extend(["-i", input_path])
 
-        # ── Video Codec ──
+        # ── Video Codec — GPU first ──
         if settings.codec == "hevc":
-            if use_gpu:
+            if use_gpu and self._has_hevc_nvenc:
                 cmd.extend(self._hevc_nvenc_args(settings))
+                logger.info("Using HEVC NVENC (GPU)")
             else:
                 cmd.extend(self._hevc_cpu_args(settings))
+                logger.warning("Using libx265 (CPU) — GPU not available for HEVC")
+
         elif settings.codec == "av1":
-            # SVT-AV1 is always CPU — it's fast and efficient
-            if use_gpu:
-                # Download from GPU first if hwaccel was used
-                cmd.extend(["-hwaccel_output_format", "nv12"])
-            cmd.extend(self._svt_av1_args(settings))
+            if use_gpu and self._has_av1_nvenc:
+                cmd.extend(self._av1_nvenc_args(settings))
+                logger.info("Using AV1 NVENC (GPU)")
+            else:
+                cmd.extend(self._svt_av1_args(settings))
+                if use_gpu:
+                    logger.info("Using SVT-AV1 (CPU) — this GPU doesn't support AV1 NVENC")
+                else:
+                    logger.warning("Using SVT-AV1 (CPU)")
 
         # ── Resolution scaling ──
         if settings.resolution:
             w, h = settings.resolution.split("x")
-            if use_gpu and settings.codec == "hevc":
+            if use_gpu and self._can_use_nvenc_for(settings.codec) and self._has_cuda_decode:
+                # GPU-accelerated scaling
                 cmd.extend(["-vf", f"scale_cuda={w}:{h}:interp_algo=lanczos"])
             else:
                 cmd.extend(["-vf", f"scale={w}:{h}:flags=lanczos"])
@@ -145,7 +192,6 @@ class Encoder:
             cmd.extend(["-c:s", "copy"])
         elif settings.subtitle_mode == "none":
             cmd.extend(["-sn"])
-        # "burn" is handled via -vf subtitles filter (complex — needs separate handling)
 
         # ── Extra flags ──
         cmd.extend(settings.extra_flags)
@@ -154,8 +200,16 @@ class Encoder:
         cmd.extend(["-map", "0", output_path])
         return cmd
 
+    def _can_use_nvenc_for(self, codec: str) -> bool:
+        """Check if NVENC is available for the given codec."""
+        if codec == "hevc":
+            return self._has_hevc_nvenc
+        elif codec == "av1":
+            return self._has_av1_nvenc
+        return False
+
     def _hevc_nvenc_args(self, settings: EncodeSettings) -> list[str]:
-        """HEVC NVENC arguments optimized for T4."""
+        """HEVC NVENC arguments. Frames stay on GPU (cuda surfaces)."""
         preset = HEVC_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["hevc_cq"]
         return [
@@ -174,11 +228,32 @@ class Encoder:
             "-b_ref_mode", "middle",
             "-tier", "high",
             "-profile:v", "main10",
-            "-pix_fmt", "p010le",
+            # NO -pix_fmt here! Let NVENC handle it from cuda surfaces.
+            # Setting pix_fmt forces CPU conversion and breaks GPU pipeline.
+        ]
+
+    def _av1_nvenc_args(self, settings: EncodeSettings) -> list[str]:
+        """AV1 NVENC arguments (RTX 40xx+ GPUs)."""
+        preset = AV1_NVENC_PRESETS.get(settings.preset, "p5")
+        cq = QUALITY_MAP[settings.quality]["av1_cq"]
+        return [
+            "-c:v", "av1_nvenc",
+            "-preset", preset,
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", str(cq),
+            "-b:v", "0",
+            "-maxrate", "20M",
+            "-bufsize", "40M",
+            "-spatial_aq", "1",
+            "-temporal_aq", "1",
+            "-rc-lookahead", "32",
+            "-tier", "1",
+            "-highbitdepth", "1",
         ]
 
     def _hevc_cpu_args(self, settings: EncodeSettings) -> list[str]:
-        """HEVC CPU (libx265) arguments."""
+        """HEVC CPU (libx265) fallback."""
         preset = HEVC_CPU_PRESETS.get(settings.preset, "medium")
         crf = QUALITY_MAP[settings.quality]["hevc_crf"]
         return [
@@ -191,7 +266,7 @@ class Encoder:
         ]
 
     def _svt_av1_args(self, settings: EncodeSettings) -> list[str]:
-        """SVT-AV1 arguments."""
+        """SVT-AV1 CPU fallback."""
         preset = SVT_AV1_PRESETS.get(settings.preset, "6")
         crf = QUALITY_MAP[settings.quality]["av1_crf"]
         return [
@@ -212,55 +287,48 @@ class Encoder:
     ) -> str:
         """Encode a video file. Returns the output file path.
 
-        Args:
-            input_path: Path to input video file.
-            settings: Encoding settings.
-            progress_callback: Called with (current_seconds, total_seconds).
-
-        Returns:
-            Path to the encoded output file.
-
-        Raises:
-            RuntimeError: If encoding fails.
+        GPU-first: tries NVENC, only falls back to CPU if GPU genuinely unavailable.
         """
         await self.initialize()
 
-        # Determine output extension
         ext = ".mkv" if settings.subtitle_mode == "copy" else ".mp4"
         codec_tag = settings.codec.upper()
-        output_path = get_output_path(
-            input_path,
-            f"{codec_tag}_{settings.quality}",
-            ext,
-        )
+        output_path = get_output_path(input_path, f"{codec_tag}_{settings.quality}", ext)
 
-        # Rebuild command if GPU not available but was requested
-        if settings.use_gpu and not self.gpu_available:
-            logger.warning("GPU requested but not available — falling back to CPU")
+        # Force GPU if available
+        if self._gpu_name:
+            settings.use_gpu = True
+        else:
+            logger.warning("No GPU — falling back to CPU encoding (will be slow)")
             settings.use_gpu = False
 
         cmd = self._build_command(input_path, output_path, settings)
         logger.info("Encoding command: %s", " ".join(cmd))
 
-        # Get duration for progress tracking
         duration = await self._get_duration(input_path)
 
-        # Run FFmpeg with progress parsing
+        # ── Run FFmpeg ──
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Parse FFmpeg stderr for progress
         current_time = 0.0
         stderr_output = []
+        gpu_confirmed = False
 
         async for line in proc.stderr:
             text = line.decode("utf-8", errors="replace").strip()
             stderr_output.append(text)
 
-            # Parse time= from FFmpeg output
+            # Verify GPU is actually being used
+            if not gpu_confirmed and settings.use_gpu:
+                if "hevc_nvenc" in text or "av1_nvenc" in text or "nvenc" in text.lower():
+                    gpu_confirmed = True
+                    logger.info("✅ GPU encoding CONFIRMED in FFmpeg output")
+
+            # Parse progress
             match = re.search(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})", text)
             if match and duration > 0:
                 h, m, s, cs = (int(x) for x in match.groups())
@@ -273,6 +341,48 @@ class Encoder:
 
         await proc.wait()
 
+        # ── Handle NVENC failure → retry with CPU ──
+        if proc.returncode != 0 and settings.use_gpu:
+            error_text = "\n".join(stderr_output[-30:]).lower()
+            nvenc_errors = [
+                "no capable devices found",
+                "cannot load nvenc",
+                "nvenc error",
+                "encoder not found",
+                "unknown encoder",
+                "initialization failed",
+                "out of memory",
+                "invalid",
+            ]
+            if any(err in error_text for err in nvenc_errors):
+                logger.warning(
+                    "NVENC failed — retrying with CPU encoder. Error: %s",
+                    stderr_output[-5:] if stderr_output else "unknown",
+                )
+                settings.use_gpu = False
+                cmd = self._build_command(input_path, output_path, settings)
+                logger.info("CPU fallback command: %s", " ".join(cmd))
+
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stderr_output = []
+                async for line in proc.stderr:
+                    text = line.decode("utf-8", errors="replace").strip()
+                    stderr_output.append(text)
+                    match = re.search(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})", text)
+                    if match and duration > 0:
+                        h, m, s, cs = (int(x) for x in match.groups())
+                        current_time = h * 3600 + m * 60 + s + cs / 100
+                        if progress_callback:
+                            try:
+                                progress_callback(current_time, duration)
+                            except Exception:
+                                pass
+                await proc.wait()
+
         if proc.returncode != 0:
             error_tail = "\n".join(stderr_output[-20:])
             logger.error("Encoding failed (exit %d):\n%s", proc.returncode, error_tail)
@@ -281,12 +391,14 @@ class Encoder:
         if not Path(output_path).exists():
             raise RuntimeError("FFmpeg completed but output file not found")
 
-        output_size = Path(output_path).stat().st_size
-        logger.info(
-            "Encoding complete: %s (%s bytes)",
-            output_path,
-            output_size,
-        )
+        # Log GPU usage summary
+        if settings.use_gpu and gpu_confirmed:
+            logger.info("✅ Encoding complete (GPU): %s", output_path)
+        elif settings.use_gpu and not gpu_confirmed:
+            logger.warning("⚠️ GPU was requested but could not confirm GPU usage in output")
+        else:
+            logger.info("Encoding complete (CPU fallback): %s", output_path)
+
         return output_path
 
     async def _get_duration(self, file_path: str) -> float:
@@ -307,10 +419,9 @@ class Encoder:
 
     @staticmethod
     def get_supported_codecs() -> dict[str, str]:
-        """Return dict of supported codec IDs to display names."""
         return {
-            "hevc": "H.265/HEVC (NVENC + CPU)",
-            "av1": "AV1 (SVT-AV1)",
+            "hevc": "H.265/HEVC (NVENC GPU + CPU fallback)",
+            "av1": "AV1 (NVENC GPU or SVT-AV1 CPU)",
         }
 
 

@@ -5,7 +5,9 @@ All /slash commands are defined and registered here.
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -44,32 +46,57 @@ def admin_only(func):
 def register_commands(app: Client) -> None:
     """Register all command handlers on the Pyrogram client."""
 
+    # ── Welcome images ──
+    WELCOME_IMAGES_DIR = Path(__file__).parent / "assets"
+
+    def _get_random_welcome_image() -> str:
+        """Pick a random welcome image from assets/."""
+        images = sorted(WELCOME_IMAGES_DIR.glob("welcome_*.png"))
+        if not images:
+            return ""
+        return str(random.choice(images))
+
     # ── /start ──
 
     @app.on_message(filters.command("start") & filters.private)
     async def cmd_start(client: Client, message: Message) -> None:
-        """Welcome message."""
+        """Welcome message with anime waifu image."""
         user = message.from_user
         await db.add_user(user.id, user.username or "")
 
         gpu_status = f"✅ {encoder.gpu_name}" if encoder.gpu_available else "❌ CPU mode"
         upscaler_status = "✅ Available" if await upscaler.check_available() else "❌ Not installed"
 
-        await message.reply_text(
-            f"🎬 **Welcome to AnimeEncoderBot!**\n\n"
-            f"Hi **{user.first_name}**! I can encode and upscale your anime videos "
-            f"using GPU acceleration.\n\n"
-            f"**🔧 System Status**\n"
-            f"├ GPU: {gpu_status}\n"
-            f"├ Upscaler: {upscaler_status}\n"
-            f"└ Workers: {Config.CONCURRENT_TASKS}\n\n"
+        welcome_text = (
+            f"👋 **Hello {user.first_name}!**\n\n"
+            f"🎬 I am **AnimeEncoderBot**\n"
+            f"_Professional AI-Enhanced Video Encoding._\n\n"
+            f"> 🧠 AI Upscaling: Real-ESRGAN (Anime V3)\n"
+            f"> 🎬 Codecs: H.265 (HEVC) / AV1\n"
+            f"> 📺 Resolution: Up to 8K\n"
+            f"> ⚡ GPU Accelerated: {gpu_status}\n"
+            f"> 🔍 Upscaler: {upscaler_status}\n\n"
             f"**📋 Quick Start**\n"
             f"├ /encode — Encode video (AV1 / HEVC)\n"
             f"├ /upscale — AI upscale anime video\n"
             f"├ /help — Full command list\n"
-            f"└ /settings — Your preferences\n\n"
-            f"Send /help for detailed usage instructions.",
+            f"└ /settings — Your preferences"
         )
+
+        # Send with random anime waifu image
+        welcome_img = _get_random_welcome_image()
+        if welcome_img:
+            try:
+                await message.reply_photo(
+                    photo=welcome_img,
+                    caption=welcome_text,
+                )
+                return
+            except Exception as e:
+                logger.warning("Failed to send welcome image: %s", e)
+
+        # Fallback to text-only
+        await message.reply_text(welcome_text)
 
     # ── /help ──
 

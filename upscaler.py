@@ -288,7 +288,14 @@ class Upscaler:
         target_w: int,
         target_h: int,
     ) -> None:
-        """Reassemble upscaled frames into video with original audio."""
+        """Reassemble upscaled frames into video with original audio.
+        Uses GPU (NVENC) for encoding when available.
+        """
+        from utils import detect_nvidia_gpu, check_nvenc_support
+
+        gpu_name = await detect_nvidia_gpu()
+        has_nvenc = await check_nvenc_support() if gpu_name else False
+
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             # Input upscaled frames
@@ -298,11 +305,36 @@ class Upscaler:
             "-i", original_input,
             # Scale to exact target (in case upscale overshot)
             "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
-            # Video codec — use libx264 for compatibility (already upscaled)
-            "-c:v", "libx265",
-            "-crf", "16",
-            "-preset", "medium",
-            "-pix_fmt", "yuv420p10le",
+        ]
+
+        if has_nvenc:
+            # GPU-accelerated encoding for reassembly
+            logger.info("Reassembling with HEVC NVENC (GPU)")
+            cmd.extend([
+                "-c:v", "hevc_nvenc",
+                "-preset", "p5",
+                "-tune", "hq",
+                "-rc", "vbr",
+                "-cq", "18",
+                "-b:v", "0",
+                "-maxrate", "30M",
+                "-bufsize", "60M",
+                "-spatial_aq", "1",
+                "-temporal_aq", "1",
+                "-rc-lookahead", "32",
+                "-profile:v", "main10",
+            ])
+        else:
+            # CPU fallback
+            logger.warning("Reassembling with libx265 (CPU) — no GPU available")
+            cmd.extend([
+                "-c:v", "libx265",
+                "-crf", "16",
+                "-preset", "medium",
+                "-pix_fmt", "yuv420p10le",
+            ])
+
+        cmd.extend([
             # Copy audio from original
             "-c:a", "copy",
             # Copy subtitles
@@ -312,7 +344,7 @@ class Upscaler:
             "-map", "1:a?",    # Audio from original
             "-map", "1:s?",    # Subtitles from original
             output_path,
-        ]
+        ])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -322,7 +354,31 @@ class Upscaler:
         _, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            raise RuntimeError(f"Video reassembly failed: {stderr.decode()}")
+            # If NVENC failed, retry with CPU
+            if has_nvenc:
+                logger.warning("NVENC reassembly failed, retrying with CPU...")
+                cmd_cpu = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    "-framerate", str(fps),
+                    "-i", str(frames_dir / "frame_%08d.png"),
+                    "-i", original_input,
+                    "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
+                    "-c:v", "libx265", "-crf", "16", "-preset", "medium",
+                    "-pix_fmt", "yuv420p10le",
+                    "-c:a", "copy", "-c:s", "copy",
+                    "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
+                    output_path,
+                ]
+                proc2 = await asyncio.create_subprocess_exec(
+                    *cmd_cpu,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr2 = await proc2.communicate()
+                if proc2.returncode != 0:
+                    raise RuntimeError(f"Video reassembly failed: {stderr2.decode()}")
+            else:
+                raise RuntimeError(f"Video reassembly failed: {stderr.decode()}")
 
 
 # Global upscaler instance

@@ -218,7 +218,7 @@ async def _upload_result(task: Task, output_path: str) -> None:
         )
 
     if file_size <= Config.TG_UPLOAD_LIMIT:
-        # ── Direct Telegram upload (< 2GB) ──
+        # ── Direct Telegram upload (< 2GB) with progress ──
         caption = (
             f"✅ **{task_label} Complete!**\n\n"
             f"💾 Size: `{human_size(file_size)}`\n"
@@ -226,18 +226,48 @@ async def _upload_result(task: Task, output_path: str) -> None:
             f"{info_lines}"
         )
 
+        upload_msg = await app.send_message(
+            chat_id,
+            f"📤 **Uploading to Telegram...**\n\n"
+            f"💾 Size: `{human_size(file_size)}`\n"
+            f"⏳ Starting upload..."
+        )
+
+        ul_last_update = [0.0]
+
+        async def upload_progress(current: int, total: int) -> None:
+            import time
+            now = time.time()
+            if now - ul_last_update[0] < 3:
+                return
+            ul_last_update[0] = now
+            percent = (current / total * 100) if total > 0 else 0
+            bar_len = 20
+            filled = int(bar_len * current / total) if total > 0 else 0
+            bar = "█" * filled + "░" * (bar_len - filled)
+            await _safe_edit(
+                chat_id, upload_msg.id,
+                f"📤 **Uploading to Telegram...**\n\n"
+                f"[{bar}] `{percent:.1f}%`\n"
+                f"💾 `{human_size(current)}` / `{human_size(total)}`"
+            )
+
         try:
-            await app.send_message(chat_id, f"📤 Uploading to Telegram... (`{human_size(file_size)}`)")
             await app.send_document(
                 chat_id,
                 document=output_path,
                 caption=caption,
                 force_document=True,
+                progress=upload_progress,
             )
+            # Delete the progress message after successful upload
+            try:
+                await upload_msg.delete()
+            except Exception:
+                pass
         except Exception as e:
             logger.error("Telegram upload failed: %s", e)
-            await app.send_message(
-                chat_id,
+            await upload_msg.edit_text(
                 f"❌ Telegram upload failed: `{str(e)[:300]}`\n\n"
                 "Trying Google Drive fallback...",
             )
@@ -392,18 +422,45 @@ async def on_file_received(client: Client, message: Message) -> None:
         )
         return
 
-    # Download the file
-    progress_msg = await message.reply_text("📥 Downloading file...")
+    # ── Download with progress ──
+    progress_msg = await message.reply_text(
+        f"📥 **Downloading...**\n\n"
+        f"💾 Size: `{human_size(file_size)}`\n"
+        f"⏳ Starting download..."
+    )
+
+    dl_last_update = [0.0]
+
+    async def download_progress(current: int, total: int) -> None:
+        import time
+        now = time.time()
+        if now - dl_last_update[0] < 3:  # Throttle to every 3s
+            return
+        dl_last_update[0] = now
+        percent = (current / total * 100) if total > 0 else 0
+        bar_len = 20
+        filled = int(bar_len * current / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+        await _safe_edit(
+            message.chat.id, progress_msg.id,
+            f"📥 **Downloading...**\n\n"
+            f"[{bar}] `{percent:.1f}%`\n"
+            f"💾 `{human_size(current)}` / `{human_size(total)}`"
+        )
 
     try:
         download_path = os.path.join(Config.DOWNLOAD_DIR, f"{user_id}_{filename}")
-        await message.download(file_name=download_path)
+        await message.download(file_name=download_path, progress=download_progress)
     except Exception as e:
         await progress_msg.edit_text(f"❌ Download failed: `{str(e)[:200]}`")
         clear_workflow(user_id)
         return
 
-    await progress_msg.edit_text("📥 Download complete. Getting media info...")
+    await progress_msg.edit_text(
+        f"📥 **Download complete!** ✅\n\n"
+        f"💾 Size: `{human_size(file_size)}`\n"
+        f"🔍 Analyzing media..."
+    )
 
     # Show media info
     info = await get_media_info(download_path)
@@ -463,9 +520,17 @@ async def on_startup() -> None:
     # Connect to MongoDB
     await db.connect()
 
-    # Initialize encoder (GPU detection)
+    # Initialize encoder (GPU detection + verification)
     await encoder.initialize()
-    logger.info("GPU: %s | NVENC: %s", encoder.gpu_name, encoder.gpu_available)
+    logger.info("GPU: %s | HEVC NVENC: %s | AV1 NVENC: %s",
+                encoder.gpu_name, encoder.gpu_available, encoder.has_av1_nvenc)
+
+    # Verify GPU actually works (not just detected)
+    if encoder.gpu_available:
+        from utils import verify_gpu_encoding
+        gpu_works = await verify_gpu_encoding([])
+        if not gpu_works:
+            logger.error("⚠️ GPU detected but NVENC test FAILED — encoding may fall back to CPU")
 
     # Check upscaler
     upscaler_ok = await upscaler.check_available()

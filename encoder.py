@@ -68,6 +68,7 @@ class EncodeSettings:
     use_gpu: bool = True
     resolution: Optional[str] = None
     extra_flags: list[str] = field(default_factory=list)
+    gpu_id: Optional[int] = None
 
 
 class Encoder:
@@ -143,6 +144,8 @@ class Encoder:
         # Use cuvid/cuda decoder to keep frames on GPU memory
         if use_gpu and self._has_cuda_decode:
             cmd.extend(["-hwaccel", "cuda"])
+            if settings.gpu_id is not None:
+                cmd.extend(["-hwaccel_device", str(settings.gpu_id)])
             # Only keep on GPU surface if we're encoding with NVENC
             # (not SVT-AV1 which needs CPU frames)
             if self._can_use_nvenc_for(settings.codec):
@@ -154,7 +157,7 @@ class Encoder:
         if settings.codec == "hevc":
             if use_gpu and self._has_hevc_nvenc:
                 cmd.extend(self._hevc_nvenc_args(settings))
-                logger.info("Using HEVC NVENC (GPU)")
+                logger.info(f"Using HEVC NVENC (GPU {settings.gpu_id if settings.gpu_id is not None else 0})")
             else:
                 cmd.extend(self._hevc_cpu_args(settings))
                 logger.warning("Using libx265 (CPU) — GPU not available for HEVC")
@@ -162,7 +165,7 @@ class Encoder:
         elif settings.codec == "av1":
             if use_gpu and self._has_av1_nvenc:
                 cmd.extend(self._av1_nvenc_args(settings))
-                logger.info("Using AV1 NVENC (GPU)")
+                logger.info(f"Using AV1 NVENC (GPU {settings.gpu_id if settings.gpu_id is not None else 0})")
             else:
                 cmd.extend(self._svt_av1_args(settings))
                 if use_gpu:
@@ -212,7 +215,7 @@ class Encoder:
         """HEVC NVENC arguments. Frames stay on GPU (cuda surfaces)."""
         preset = HEVC_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["hevc_cq"]
-        return [
+        args = [
             "-c:v", "hevc_nvenc",
             "-preset", preset,
             "-tune", "hq",
@@ -228,15 +231,16 @@ class Encoder:
             "-b_ref_mode", "middle",
             "-tier", "high",
             "-profile:v", "main10",
-            # NO -pix_fmt here! Let NVENC handle it from cuda surfaces.
-            # Setting pix_fmt forces CPU conversion and breaks GPU pipeline.
         ]
+        if settings.gpu_id is not None:
+            args.extend(["-gpu", str(settings.gpu_id)])
+        return args
 
     def _av1_nvenc_args(self, settings: EncodeSettings) -> list[str]:
         """AV1 NVENC arguments (RTX 40xx+ GPUs)."""
         preset = AV1_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["av1_cq"]
-        return [
+        args = [
             "-c:v", "av1_nvenc",
             "-preset", preset,
             "-tune", "hq",
@@ -251,6 +255,9 @@ class Encoder:
             "-tier", "1",
             "-highbitdepth", "1",
         ]
+        if settings.gpu_id is not None:
+            args.extend(["-gpu", str(settings.gpu_id)])
+        return args
 
     def _hevc_cpu_args(self, settings: EncodeSettings) -> list[str]:
         """HEVC CPU (libx265) fallback."""

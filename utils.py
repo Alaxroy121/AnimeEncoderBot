@@ -269,6 +269,23 @@ async def detect_nvidia_gpu() -> Optional[str]:
     return None
 
 
+async def get_gpu_count() -> int:
+    """Get the number of available NVIDIA GPUs."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi", "--query-gpu=name", "--format=csv,noheader",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            lines = [line.strip() for line in stdout.decode().strip().split("\n") if line.strip()]
+            return len(lines)
+    except Exception:
+        pass
+    return 1
+
+
 async def check_nvenc_support() -> bool:
     """Check if FFmpeg has HEVC NVENC support."""
     try:

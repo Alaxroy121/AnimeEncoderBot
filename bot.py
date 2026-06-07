@@ -26,6 +26,7 @@ from utils import (
     human_size,
     is_supported_video,
     ProgressTracker,
+    get_gpu_count,
 )
 
 from commands import register_commands
@@ -68,11 +69,15 @@ app = Client(
 async def process_task(task: Task) -> None:
     """The main processing function executed by queue_manager workers."""
     try:
+        # Detect GPU mapping
+        gpu_count = await get_gpu_count()
+        gpu_id = (task.worker_id % gpu_count) if (task.worker_id is not None and gpu_count > 0) else 0
+        logger.info(f"Task {task.task_id} assigned to worker {task.worker_id} (GPU {gpu_id})")
+
         # Create an async progress callback for Pyrogram upload/download
         async def pyrogram_progress(current: int, total: int) -> None:
             if not total:
                 return
-            tracker.update(current)
             if tracker.update(current): # Returns True if it's time to update
                 try:
                     await app.edit_message_text(
@@ -119,10 +124,12 @@ async def process_task(task: Task) -> None:
             percent = (current / total * 100) if total > 0 else 0
             if getattr(processing_progress, 'last_percent', 0) + 5 <= percent:
                 processing_progress.last_percent = percent
+                from utils import progress_bar
+                bar = progress_bar(percent)
                 asyncio.create_task(app.edit_message_text(
                     chat_id=task.progress_chat_id,
                     message_id=task.progress_message_id,
-                    text=f"⚙️ **Processing...**\n\n📊 Progress: `{percent:.1f}%`",
+                    text=f"⚙️ **{task_action}...**\n\n{bar}\n📊 Progress: `{percent:.1f}%` ({int(current)}/{int(total)} frames)",
                     parse_mode=enums.ParseMode.MARKDOWN
                 ))
         processing_progress.last_percent = 0
@@ -135,23 +142,38 @@ async def process_task(task: Task) -> None:
                 preset=task.settings.get("preset", "medium"),
                 audio_codec=task.settings.get("audio", "copy"),
                 use_gpu=Config.GPU_ENABLED,
+                gpu_id=gpu_id,
             )
             output_path = await encoder.encode(input_path, encode_settings, processing_progress)
             
         elif task.task_type == TaskType.UPSCALE:
             task_action = "Upscaling"
+            await app.edit_message_text(
+                chat_id=task.progress_chat_id,
+                message_id=task.progress_message_id,
+                text="🎞️ **Extracting video frames...**",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
             output_path = await upscaler.upscale(
                 input_path, 
                 target_resolution=task.settings.get("resolution", "4k"), 
-                progress_callback=processing_progress
+                progress_callback=processing_progress,
+                gpu_id=gpu_id,
             )
             
         elif task.task_type == TaskType.UPSCALE_ENCODE:
             task_action = "Upscaling"
+            await app.edit_message_text(
+                chat_id=task.progress_chat_id,
+                message_id=task.progress_message_id,
+                text="🎞️ **Extracting video frames...**",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
             upscaled_path = await upscaler.upscale(
                 input_path, 
                 target_resolution=task.settings.get("resolution", "4k"), 
-                progress_callback=processing_progress
+                progress_callback=processing_progress,
+                gpu_id=gpu_id,
             )
             if task.cancel_event.is_set():
                 cleanup_files(input_path, upscaled_path)
@@ -165,6 +187,7 @@ async def process_task(task: Task) -> None:
                 preset=task.settings.get("preset", "medium"),
                 audio_codec=task.settings.get("audio", "copy"),
                 use_gpu=Config.GPU_ENABLED,
+                gpu_id=gpu_id,
             )
             output_path = await encoder.encode(upscaled_path, encode_settings, processing_progress)
             cleanup_files(upscaled_path)

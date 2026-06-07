@@ -15,13 +15,16 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - bot-sessions:/app/anime_encoder_bot.session
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [gpu, compute, utility, graphics]
     depends_on:
       - mongo
 

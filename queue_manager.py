@@ -47,6 +47,7 @@ class Task:
     progress_message_id: Optional[int] = None
     progress_chat_id: Optional[int] = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    worker_id: Optional[int] = None
 
     @staticmethod
     def generate_id() -> str:
@@ -199,6 +200,7 @@ class QueueManager:
     async def _process_task(self, task: Task, worker_id: int) -> None:
         """Process a single task with timeout and retry logic."""
         task.status = TaskStatus.PROCESSING
+        task.worker_id = worker_id
         await db.update_task(task.task_id, {
             "status": TaskStatus.PROCESSING.value,
             "started_at": None,  # Will be set by $currentDate in a real impl

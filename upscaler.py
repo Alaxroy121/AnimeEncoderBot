@@ -85,6 +85,7 @@ class Upscaler:
         input_path: str,
         target_resolution: str = "4k",
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        gpu_id: int = 0,
     ) -> str:
         """Upscale a video using Real-ESRGAN frame-by-frame pipeline.
 
@@ -92,6 +93,7 @@ class Upscaler:
             input_path: Path to input video.
             target_resolution: Target resolution key (1080p, 2k, 4k, 8k).
             progress_callback: Called with (current_frame, total_frames).
+            gpu_id: GPU ID to run upscaling on.
 
         Returns:
             Path to upscaled output video.
@@ -133,20 +135,21 @@ class Upscaler:
             logger.info("Extracted %d frames", total_frames)
 
             # Step 3: Upscale frames with Real-ESRGAN
-            logger.info("Upscaling frames with Real-ESRGAN (model: %s, scale: %dx)...", ANIME_MODEL, scale)
+            logger.info(f"Upscaling frames with Real-ESRGAN (model: {ANIME_MODEL}, scale: {scale}x) on GPU {gpu_id}...")
             await self._upscale_frames(
                 frames_dir,
                 upscaled_dir,
                 scale=scale,
                 progress_callback=progress_callback,
                 total_frames=total_frames,
+                gpu_id=gpu_id,
             )
 
             # Step 4: Reassemble video
             target_w, target_h = RESOLUTION_MAP.get(target_resolution, (3840, 2160))
             output_path = get_output_path(input_path, f"upscaled_{target_resolution}", ".mkv")
 
-            logger.info("Reassembling video at %dx%d...", target_w, target_h)
+            logger.info(f"Reassembling video at {target_w}x{target_h} on GPU {gpu_id}...")
             await self._reassemble_video(
                 upscaled_dir,
                 input_path,
@@ -154,6 +157,7 @@ class Upscaler:
                 fps,
                 target_w,
                 target_h,
+                gpu_id=gpu_id,
             )
 
             if not Path(output_path).exists():
@@ -231,6 +235,7 @@ class Upscaler:
         scale: int = 4,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         total_frames: int = 0,
+        gpu_id: int = 0,
     ) -> None:
         """Run Real-ESRGAN on extracted frames."""
         cmd = [
@@ -240,6 +245,7 @@ class Upscaler:
             "-n", ANIME_MODEL,
             "-s", str(scale),
             "-f", "png",
+            "-g", str(gpu_id),
         ]
 
         proc = await asyncio.create_subprocess_exec(
@@ -287,6 +293,7 @@ class Upscaler:
         fps: float,
         target_w: int,
         target_h: int,
+        gpu_id: int = 0,
     ) -> None:
         """Reassemble upscaled frames into video with original audio.
         Uses GPU (NVENC) for encoding when available.
@@ -309,7 +316,7 @@ class Upscaler:
 
         if has_nvenc:
             # GPU-accelerated encoding for reassembly
-            logger.info("Reassembling with HEVC NVENC (GPU)")
+            logger.info(f"Reassembling with HEVC NVENC (GPU {gpu_id})")
             cmd.extend([
                 "-c:v", "hevc_nvenc",
                 "-preset", "p5",
@@ -324,6 +331,8 @@ class Upscaler:
                 "-rc-lookahead", "32",
                 "-profile:v", "main10",
             ])
+            if gpu_id is not None:
+                cmd.extend(["-gpu", str(gpu_id)])
         else:
             # CPU fallback
             logger.warning("Reassembling with libx265 (CPU) — no GPU available")

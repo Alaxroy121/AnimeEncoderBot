@@ -204,15 +204,13 @@ class Upscaler:
         return {"width": width, "height": height, "fps": fps, "fps_str": fps_str}
 
     async def _extract_frames(self, input_path: str, frames_dir: Path, fps: float) -> int:
-        """Extract all frames from video as PNG images."""
+        """Extract all frames from video as high-quality JPEG images."""
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-i", input_path,
-            "-qscale:v", "1",
-            "-qmin", "1",
-            "-qmax", "1",
+            "-q:v", "2",
             "-vsync", "0",
-            str(frames_dir / "frame_%08d.png"),
+            str(frames_dir / "frame_%08d.jpg"),
         ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -225,7 +223,7 @@ class Upscaler:
             raise RuntimeError(f"Frame extraction failed: {stderr.decode()}")
 
         # Count extracted frames
-        frame_files = sorted(frames_dir.glob("frame_*.png"))
+        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
         return len(frame_files)
 
     async def _upscale_frames(

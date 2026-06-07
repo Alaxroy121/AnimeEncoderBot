@@ -14,7 +14,7 @@ services:
       - config.env
     volumes:
       - ./downloads:/app/downloads
-      - bot-sessions:/app/AnimeEncoderBot.session
+      - bot-sessions:/app/anime_encoder_bot.session
     deploy:
       resources:
         reservations:

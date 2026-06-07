@@ -1,8 +1,9 @@
-# AnimeEncoderBot - Python Dependencies
+# AnimeEncoderBot - Python Dependencies (Pyrogram MTProto)
 # Install: pip install -r requirements.txt
 
-# Telegram Bot Framework (Bot API - more reliable than MTProto)
-python-telegram-bot>=21.0
+# Telegram MTProto Framework (Pyrogram - native async MTProto)
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
 
 # MongoDB async driver
 motor>=3.3.0

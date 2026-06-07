@@ -126,16 +126,20 @@ def register_callbacks(app: Client) -> None:
         """Handle codec selection."""
         user_id = query.from_user.id
         wf = get_workflow(user_id)
-        if not wf or wf.get("type") != "encode":
-            await query.answer("⚠️ No active workflow. Use /encode first.", show_alert=True)
+        if not wf or wf.get("type") not in ("encode", "upscale_encode"):
+            await query.answer("⚠️ No active workflow. Use /encode or send a video first.", show_alert=True)
             return
 
         codec = query.data.replace("codec_", "")
         wf["codec"] = codec
         set_workflow(user_id, wf)
 
+        prefix = ""
+        if wf.get("type") == "upscale_encode":
+            prefix = f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
+
         await query.message.edit_text(
-            f"🎬 Codec: **{codec.upper()}**\n\n"
+            f"{prefix}🎬 Codec: **{codec.upper()}**\n\n"
             "Choose quality level:",
             reply_markup=quality_keyboard(),
         )
@@ -146,7 +150,7 @@ def register_callbacks(app: Client) -> None:
         """Handle quality selection."""
         user_id = query.from_user.id
         wf = get_workflow(user_id)
-        if not wf or wf.get("type") != "encode":
+        if not wf or wf.get("type") not in ("encode", "upscale_encode"):
             await query.answer("⚠️ No active workflow.", show_alert=True)
             return
 
@@ -154,8 +158,12 @@ def register_callbacks(app: Client) -> None:
         wf["quality"] = quality
         set_workflow(user_id, wf)
 
+        prefix = ""
+        if wf.get("type") == "upscale_encode":
+            prefix = f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
+
         await query.message.edit_text(
-            f"🎬 Codec: **{wf['codec'].upper()}**\n"
+            f"{prefix}🎬 Codec: **{wf['codec'].upper()}**\n"
             f"✨ Quality: **{quality.capitalize()}**\n\n"
             "Choose encoding speed preset:",
             reply_markup=preset_keyboard(),
@@ -167,7 +175,7 @@ def register_callbacks(app: Client) -> None:
         """Handle preset selection."""
         user_id = query.from_user.id
         wf = get_workflow(user_id)
-        if not wf or wf.get("type") != "encode":
+        if not wf or wf.get("type") not in ("encode", "upscale_encode"):
             await query.answer("⚠️ No active workflow.", show_alert=True)
             return
 
@@ -175,8 +183,12 @@ def register_callbacks(app: Client) -> None:
         wf["preset"] = preset
         set_workflow(user_id, wf)
 
+        prefix = ""
+        if wf.get("type") == "upscale_encode":
+            prefix = f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
+
         await query.message.edit_text(
-            f"🎬 Codec: **{wf['codec'].upper()}**\n"
+            f"{prefix}🎬 Codec: **{wf['codec'].upper()}**\n"
             f"✨ Quality: **{wf['quality'].capitalize()}**\n"
             f"🏃 Preset: **{preset.capitalize()}**\n\n"
             "Choose audio handling:",
@@ -189,7 +201,7 @@ def register_callbacks(app: Client) -> None:
         """Handle audio codec selection — shows confirmation."""
         user_id = query.from_user.id
         wf = get_workflow(user_id)
-        if not wf or wf.get("type") != "encode":
+        if not wf or wf.get("type") not in ("encode", "upscale_encode"):
             await query.answer("⚠️ No active workflow.", show_alert=True)
             return
 
@@ -197,14 +209,26 @@ def register_callbacks(app: Client) -> None:
         wf["audio"] = audio
         set_workflow(user_id, wf)
 
-        summary = (
-            "📋 **Encoding Settings Summary**\n\n"
-            f"🎬 Codec: **{wf['codec'].upper()}**\n"
-            f"✨ Quality: **{wf['quality'].capitalize()}**\n"
-            f"🏃 Preset: **{wf['preset'].capitalize()}**\n"
-            f"🔊 Audio: **{audio.upper()}**\n\n"
-            "Send the video file to start encoding, or press Cancel."
-        )
+        if wf.get("type") == "upscale_encode":
+            summary = (
+                "📋 **Encoding & Upscaling Settings Summary**\n\n"
+                f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
+                f"🎬 Codec: **{wf['codec'].upper()}**\n"
+                f"✨ Quality: **{wf['quality'].capitalize()}**\n"
+                f"🏃 Preset: **{wf['preset'].capitalize()}**\n"
+                f"🔊 Audio: **{audio.upper()}**\n\n"
+                "Send the video file to start processing, or press Cancel."
+            )
+        else:
+            summary = (
+                "📋 **Encoding Settings Summary**\n\n"
+                f"🎬 Codec: **{wf['codec'].upper()}**\n"
+                f"✨ Quality: **{wf['quality'].capitalize()}**\n"
+                f"🏃 Preset: **{wf['preset'].capitalize()}**\n"
+                f"🔊 Audio: **{audio.upper()}**\n\n"
+                "Send the video file to start encoding, or press Cancel."
+            )
+
         wf["awaiting_file"] = True
         set_workflow(user_id, wf)
 
@@ -221,12 +245,23 @@ def register_callbacks(app: Client) -> None:
         """Handle resolution selection for upscaling."""
         user_id = query.from_user.id
         wf = get_workflow(user_id)
-        if not wf or wf.get("type") != "upscale":
+        if not wf or wf.get("type") not in ("upscale", "upscale_encode"):
             await query.answer("⚠️ No active workflow. Use /upscale first.", show_alert=True)
             return
 
         resolution = query.data.replace("res_", "")
         wf["resolution"] = resolution
+        set_workflow(user_id, wf)
+
+        if wf.get("type") == "upscale_encode":
+            # Go to codec selection
+            await query.message.edit_text(
+                "📐 Choose your codec:",
+                reply_markup=codec_keyboard(),
+            )
+            await query.answer()
+            return
+
         wf["awaiting_file"] = True
         set_workflow(user_id, wf)
 

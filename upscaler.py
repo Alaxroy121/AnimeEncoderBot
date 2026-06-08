@@ -414,8 +414,9 @@ class Upscaler:
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-i", input_path,
+            "-pix_fmt", "yuvj420p",
             "-q:v", "2",
-            "-vsync", "0",
+            "-vsync", "vfr",
             str(frames_dir / "frame_%08d.jpg"),
         ]
         proc = await asyncio.create_subprocess_exec(

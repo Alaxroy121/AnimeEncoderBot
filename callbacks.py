@@ -11,6 +11,7 @@ from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 
 from config import Config
 from database import db
+from telegram_helpers import safe_edit_text
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,8 @@ def register_callbacks(app: Client) -> None:
         if wf.get("type") == "upscale_encode":
             prefix = f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
 
-        await query.message.edit_text(
+        await safe_edit_text(
+            query.message,
             f"{prefix}🎬 Codec: **{codec.upper()}**\n\n"
             "Choose quality level:",
             reply_markup=quality_keyboard(),
@@ -162,7 +164,8 @@ def register_callbacks(app: Client) -> None:
         if wf.get("type") == "upscale_encode":
             prefix = f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
 
-        await query.message.edit_text(
+        await safe_edit_text(
+            query.message,
             f"{prefix}🎬 Codec: **{wf['codec'].upper()}**\n"
             f"✨ Quality: **{quality.capitalize()}**\n\n"
             "Choose encoding speed preset:",
@@ -187,7 +190,8 @@ def register_callbacks(app: Client) -> None:
         if wf.get("type") == "upscale_encode":
             prefix = f"📐 Target Resolution: **{wf.get('resolution', '').upper()}**\n"
 
-        await query.message.edit_text(
+        await safe_edit_text(
+            query.message,
             f"{prefix}🎬 Codec: **{wf['codec'].upper()}**\n"
             f"✨ Quality: **{wf['quality'].capitalize()}**\n"
             f"🏃 Preset: **{preset.capitalize()}**\n\n"
@@ -232,7 +236,8 @@ def register_callbacks(app: Client) -> None:
         wf["awaiting_file"] = True
         set_workflow(user_id, wf)
 
-        await query.message.edit_text(
+        await safe_edit_text(
+            query.message,
             summary,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],
@@ -255,7 +260,8 @@ def register_callbacks(app: Client) -> None:
 
         if wf.get("type") == "upscale_encode":
             # Go to codec selection
-            await query.message.edit_text(
+            await safe_edit_text(
+                query.message,
                 "📐 Choose your codec:",
                 reply_markup=codec_keyboard(),
             )
@@ -268,7 +274,8 @@ def register_callbacks(app: Client) -> None:
         res_labels = {"1080p": "1920×1080", "2k": "2560×1440", "4k": "3840×2160", "8k": "7680×4320"}
         label = res_labels.get(resolution, resolution)
 
-        await query.message.edit_text(
+        await safe_edit_text(
+            query.message,
             f"🔍 **Upscaling Settings**\n\n"
             f"📐 Target: **{resolution.upper()}** ({label})\n"
             f"🤖 Model: **Real-ESRGAN (Anime V3)**\n\n"
@@ -290,7 +297,7 @@ def register_callbacks(app: Client) -> None:
         user_id = query.from_user.id
         clear_workflow(user_id)
 
-        await query.message.edit_text("❌ Workflow cancelled.")
+        await safe_edit_text(query.message, "❌ Workflow cancelled.")
         await query.answer("Cancelled")
 
     @app.on_callback_query(filters.regex(r"^settings_"))
@@ -322,7 +329,8 @@ def register_callbacks(app: Client) -> None:
                 f"✨ Default Quality: **{settings.get('default_quality', 'medium').capitalize()}**\n"
                 f"🏃 Default Preset: **{settings.get('default_preset', 'medium').capitalize()}**\n"
             )
-            await query.message.edit_text(
+            await safe_edit_text(
+                query.message,
                 text,
                 reply_markup=_settings_keyboard(settings),
             )

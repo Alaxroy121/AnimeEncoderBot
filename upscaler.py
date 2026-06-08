@@ -87,19 +87,13 @@ class Upscaler:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         gpu_id: int = 0,
     ) -> str:
-        """Upscale a video using Real-ESRGAN segment-by-segment pipeline to save disk and prevent hangs.
+        """Upscale a video using a multi-GPU Real-ESRGAN segment pipeline.
 
-        Args:
-            input_path: Path to input video.
-            target_resolution: Target resolution key (1080p, 2k, 4k, 8k).
-            progress_callback: Called with (current_frame, total_frames).
-            gpu_id: GPU ID to run upscaling on.
-
-        Returns:
-            Path to upscaled output video.
-
-        Raises:
-            RuntimeError: If upscaling fails.
+        The old pipeline extracted and upscaled one 30-second segment at a time.
+        On Kaggle T4 x2 that leaves one GPU idle and makes Telegram sit on
+        "Extracting video frames..." for a long time. This version uses smaller
+        segments, reports extraction progress, and processes several segments in
+        parallel across the configured GPU IDs.
         """
         if not await self.check_available():
             raise RuntimeError(
@@ -114,7 +108,6 @@ class Upscaler:
         try:
             segments_dir.mkdir(parents=True, exist_ok=True)
 
-            # Step 1: Get input video info
             input_info = await self._get_video_info(input_path)
             fps = input_info["fps"]
             width = input_info["width"]
@@ -127,115 +120,153 @@ class Upscaler:
             )
 
             scale = self.calculate_scale_factor(width, height, target_resolution)
-            logger.info("Using scale factor: %dx for target %s", scale, target_resolution)
+            target_w, target_h = RESOLUTION_MAP.get(target_resolution, (3840, 2160))
+            total_frames = max(1, int(duration * fps)) if duration > 0 and fps > 0 else 0
+            segment_seconds = max(2, Config.UPSCALE_SEGMENT_SECONDS)
+            gpu_ids = await self._resolve_gpu_ids(gpu_id)
+            parallel_jobs = self._resolve_parallel_jobs(gpu_ids, expected_segments=math.ceil(duration / segment_seconds) if duration else 1)
 
-            # Step 2: Segment the input video into 30-second parts
-            logger.info("Segmenting video into chunks...")
+            logger.info(
+                "Using scale %dx for %s; segment=%ss; GPUs=%s; parallel_jobs=%s; Real-ESRGAN threads=%s; output=%s",
+                scale,
+                target_resolution,
+                segment_seconds,
+                ",".join(map(str, gpu_ids)),
+                parallel_jobs,
+                Config.REALESRGAN_THREADS,
+                Config.REALESRGAN_OUTPUT_FORMAT,
+            )
+
+            # Smaller chunks let Real-ESRGAN start quickly and allow multiple GPUs
+            # to work at the same time instead of waiting on one huge extraction.
+            logger.info("Segmenting video into %s-second chunks...", segment_seconds)
             segment_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
                 "-i", input_path,
                 "-c", "copy",
                 "-map", "0",
-                "-segment_time", "30",
+                "-segment_time", str(segment_seconds),
                 "-f", "segment",
                 "-reset_timestamps", "1",
                 str(segments_dir / "part_%03d.mkv"),
             ]
-            proc = await asyncio.create_subprocess_exec(
-                *segment_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(f"Video segmentation failed: {stderr.decode()}")
+            _, stderr = await self._run_process(segment_cmd)
+            if stderr:
+                logger.debug("Segmentation stderr: %s", stderr[:500])
 
             segment_files = sorted(segments_dir.glob("part_*.mkv"))
             if not segment_files:
                 raise RuntimeError("No segments were created")
 
-            # Estimate total frames
-            total_frames = int(duration * fps) if duration > 0 else 0
-            processed_frames = 0
-            upscaled_segments = []
+            if total_frames == 0:
+                total_frames = await self._estimate_total_frames(segment_files)
 
-            # Step 3: Process each segment
-            for i, segment_file in enumerate(segment_files):
-                logger.info(f"Processing segment {i+1}/{len(segment_files)}: {segment_file.name}")
+            total_work_units = max(1, total_frames * 2)
+            extract_progress: list[int] = [0] * len(segment_files)
+            upscale_progress: list[int] = [0] * len(segment_files)
+            progress_lock = asyncio.Lock()
 
-                part_work_dir = work_dir / f"part_{i:03d}"
-                part_frames_dir = part_work_dir / "frames"
-                part_upscaled_dir = part_work_dir / "upscaled"
-                part_output_path = part_work_dir / f"upscaled_{segment_file.name}"
-
-                part_frames_dir.mkdir(parents=True, exist_ok=True)
-                part_upscaled_dir.mkdir(parents=True, exist_ok=True)
-
-                try:
-                    # Extract frames for this segment (JPEG)
-                    segment_frames = await self._extract_frames(str(segment_file), part_frames_dir, fps)
-                    if segment_frames == 0:
-                        logger.warning(f"Segment {segment_file.name} had 0 frames, skipping")
-                        continue
-
-                    # If total_frames is 0, estimate it on the fly
-                    if total_frames == 0:
-                        total_frames = segment_frames * len(segment_files)
-
-                    # Custom progress callback for this segment
-                    def segment_progress(done_in_segment: int, total_in_segment: int):
-                        if progress_callback:
-                            progress_callback(processed_frames + done_in_segment, total_frames)
-
-                    # Upscale frames
-                    await self._upscale_frames(
-                        part_frames_dir,
-                        part_upscaled_dir,
-                        scale=scale,
-                        progress_callback=segment_progress,
-                        total_frames=segment_frames,
-                        gpu_id=gpu_id,
-                    )
-
-                    # Reassemble segment
-                    target_w, target_h = RESOLUTION_MAP.get(target_resolution, (3840, 2160))
-                    await self._reassemble_video(
-                        part_upscaled_dir,
-                        str(segment_file),
-                        str(part_output_path),
-                        fps,
-                        target_w,
-                        target_h,
-                        gpu_id=gpu_id,
-                    )
-
-                    if part_output_path.exists():
-                        upscaled_segments.append(part_output_path)
-                        processed_frames += segment_frames
+            async def update_progress(index: int, phase: str, done_in_segment: int, segment_frames: int) -> None:
+                if not progress_callback or total_frames <= 0:
+                    return
+                async with progress_lock:
+                    if phase == "extract":
+                        extract_progress[index] = min(segment_frames, max(extract_progress[index], done_in_segment))
                     else:
-                        raise RuntimeError(f"Segment reassembly failed for {segment_file.name}")
+                        extract_progress[index] = max(extract_progress[index], segment_frames)
+                        upscale_progress[index] = min(segment_frames, max(upscale_progress[index], done_in_segment))
+                    done = min(sum(extract_progress) + sum(upscale_progress), total_work_units)
+                try:
+                    progress_callback(done, total_work_units)
+                except Exception:
+                    pass
 
-                finally:
-                    # Clean up directories for this segment immediately to reclaim space!
-                    if part_frames_dir.exists():
+            semaphore = asyncio.Semaphore(parallel_jobs)
+
+            async def process_segment(index: int, segment_file: Path) -> tuple[int, Path, int]:
+                async with semaphore:
+                    assigned_gpu = gpu_ids[index % len(gpu_ids)]
+                    logger.info(
+                        "Processing segment %d/%d on GPU %s: %s",
+                        index + 1,
+                        len(segment_files),
+                        assigned_gpu,
+                        segment_file.name,
+                    )
+
+                    part_work_dir = work_dir / f"part_{index:03d}"
+                    part_frames_dir = part_work_dir / "frames"
+                    part_upscaled_dir = part_work_dir / "upscaled"
+                    part_output_path = part_work_dir / f"upscaled_{segment_file.name}"
+
+                    part_frames_dir.mkdir(parents=True, exist_ok=True)
+                    part_upscaled_dir.mkdir(parents=True, exist_ok=True)
+
+                    try:
+                        expected_segment_frames = await self._estimate_segment_frames(
+                            str(segment_file), fps, segment_seconds
+                        )
+
+                        extracted_frames = await self._extract_frames(
+                            str(segment_file),
+                            part_frames_dir,
+                            expected_frames=expected_segment_frames,
+                            progress_callback=lambda done, _total: asyncio.create_task(
+                                update_progress(index, "extract", done, expected_segment_frames)
+                            ),
+                        )
+                        if extracted_frames == 0:
+                            raise RuntimeError(f"Segment {segment_file.name} had 0 frames")
+
+                        await self._upscale_frames(
+                            part_frames_dir,
+                            part_upscaled_dir,
+                            scale=scale,
+                            progress_callback=lambda done, _total: asyncio.create_task(
+                                update_progress(index, "upscale", done, extracted_frames)
+                            ),
+                            total_frames=extracted_frames,
+                            gpu_id=assigned_gpu,
+                        )
+
+                        await self._reassemble_video(
+                            part_upscaled_dir,
+                            str(segment_file),
+                            str(part_output_path),
+                            fps,
+                            target_w,
+                            target_h,
+                            gpu_id=assigned_gpu,
+                            frame_ext=Config.REALESRGAN_OUTPUT_FORMAT,
+                        )
+
+                        if not part_output_path.exists():
+                            raise RuntimeError(f"Segment reassembly failed for {segment_file.name}")
+
+                        await update_progress(index, "upscale", extracted_frames, extracted_frames)
+                        return index, part_output_path, extracted_frames
+
+                    finally:
                         shutil.rmtree(part_frames_dir, ignore_errors=True)
-                    if part_upscaled_dir.exists():
                         shutil.rmtree(part_upscaled_dir, ignore_errors=True)
 
-            # Step 4: Concatenate all upscaled segments
+            results = await asyncio.gather(
+                *(process_segment(i, segment_file) for i, segment_file in enumerate(segment_files))
+            )
+            results.sort(key=lambda item: item[0])
+            upscaled_segments = [path for _, path, _ in results]
+
             if not upscaled_segments:
                 raise RuntimeError("No segments were successfully upscaled")
 
-            logger.info("Concatenating upscaled segments...")
+            logger.info("Concatenating %d upscaled segments...", len(upscaled_segments))
             concat_txt_path = work_dir / "concat.txt"
             with open(concat_txt_path, "w", encoding="utf-8") as f:
                 for seg in upscaled_segments:
-                    # Escape single quotes in path
                     escaped_path = str(seg).replace("'", "'\\''")
                     f.write(f"file '{escaped_path}'\n")
 
             output_path = get_output_path(input_path, f"upscaled_{target_resolution}", ".mkv")
-
             concat_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
                 "-f", "concat",
@@ -244,27 +275,87 @@ class Upscaler:
                 "-c", "copy",
                 output_path,
             ]
-            proc = await asyncio.create_subprocess_exec(
-                *concat_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(f"Video concatenation failed: {stderr.decode()}")
+            _, stderr = await self._run_process(concat_cmd)
+            if stderr:
+                logger.debug("Concatenation stderr: %s", stderr[:500])
 
             if not Path(output_path).exists():
                 raise RuntimeError("Concatenation completed but output file not found")
+
+            if progress_callback and total_frames > 0:
+                progress_callback(total_work_units, total_work_units)
 
             output_size = Path(output_path).stat().st_size
             logger.info("Upscaling complete: %s (%d bytes)", output_path, output_size)
             return output_path
 
         finally:
-            # Clean up working directory
             if work_dir.exists():
                 shutil.rmtree(work_dir, ignore_errors=True)
                 logger.debug("Cleaned up work dir: %s", work_dir)
+
+    async def _resolve_gpu_ids(self, fallback_gpu_id: int) -> list[int]:
+        """Resolve Real-ESRGAN GPU IDs from config or detected NVIDIA GPUs."""
+        configured = Config.REALESRGAN_GPU_IDS.strip().lower()
+        if configured and configured != "auto":
+            gpu_ids = [int(item.strip()) for item in configured.split(",") if item.strip().isdigit()]
+            if gpu_ids:
+                return gpu_ids
+
+        try:
+            from utils import get_gpu_count
+
+            gpu_count = await get_gpu_count()
+        except Exception:
+            gpu_count = 1
+
+        if gpu_count > 0:
+            return list(range(gpu_count))
+        return [fallback_gpu_id]
+
+    @staticmethod
+    def _resolve_parallel_jobs(gpu_ids: list[int], expected_segments: int) -> int:
+        """Choose how many Real-ESRGAN segment workers to run at once."""
+        configured_jobs = Config.UPSCALE_PARALLEL_JOBS
+        if configured_jobs > 0:
+            return max(1, min(configured_jobs, expected_segments))
+
+        jobs_per_gpu = max(1, Config.UPSCALE_JOBS_PER_GPU)
+        auto_jobs = max(1, len(gpu_ids) * jobs_per_gpu)
+        return max(1, min(auto_jobs, expected_segments))
+
+    @staticmethod
+    async def _run_process(cmd: list[str]) -> tuple[str, str]:
+        """Run a subprocess and return stdout/stderr, raising on failure."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{stderr_text}")
+        return stdout_text, stderr_text
+
+    async def _estimate_total_frames(self, segment_files: list[Path]) -> int:
+        """Estimate total frame count when container duration is unavailable."""
+        total = 0
+        for segment_file in segment_files:
+            info = await self._get_video_info(str(segment_file))
+            duration = await self._get_video_duration(str(segment_file))
+            total += max(1, int(duration * info["fps"])) if duration > 0 else 0
+        return max(1, total)
+
+    async def _estimate_segment_frames(self, segment_file: str, fps: float, segment_seconds: int) -> int:
+        """Estimate frame count for progress during frame extraction."""
+        duration = await self._get_video_duration(segment_file)
+        if duration > 0 and fps > 0:
+            return max(1, int(duration * fps))
+        if fps > 0:
+            return max(1, int(segment_seconds * fps))
+        return 0
 
     async def _get_video_info(self, file_path: str) -> dict:
         """Get basic video info (width, height, fps)."""
@@ -312,8 +403,14 @@ class Upscaler:
         except Exception:
             return 0.0
 
-    async def _extract_frames(self, input_path: str, frames_dir: Path, fps: float) -> int:
-        """Extract all frames from video as high-quality JPEG images."""
+    async def _extract_frames(
+        self,
+        input_path: str,
+        frames_dir: Path,
+        expected_frames: int = 0,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> int:
+        """Extract frames from a segment and report progress while ffmpeg runs."""
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-i", input_path,
@@ -326,14 +423,25 @@ class Upscaler:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        communicate_task = asyncio.create_task(proc.communicate())
 
+        while not communicate_task.done():
+            await asyncio.sleep(1)
+            if progress_callback and expected_frames > 0:
+                done = len(list(frames_dir.glob("frame_*.jpg")))
+                try:
+                    progress_callback(done, expected_frames)
+                except Exception:
+                    pass
+
+        stdout, stderr = await communicate_task
         if proc.returncode != 0:
-            raise RuntimeError(f"Frame extraction failed: {stderr.decode()}")
+            raise RuntimeError(f"Frame extraction failed: {stderr.decode('utf-8', errors='replace')}")
 
-        # Count extracted frames
-        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
-        return len(frame_files)
+        frame_count = len(list(frames_dir.glob("frame_*.jpg")))
+        if progress_callback and expected_frames > 0:
+            progress_callback(frame_count, expected_frames)
+        return frame_count
 
     async def _upscale_frames(
         self,
@@ -344,53 +452,53 @@ class Upscaler:
         total_frames: int = 0,
         gpu_id: int = 0,
     ) -> None:
-        """Run Real-ESRGAN on extracted frames."""
+        """Run Real-ESRGAN on extracted frames with tuned Vulkan options."""
+        output_format = Config.REALESRGAN_OUTPUT_FORMAT if Config.REALESRGAN_OUTPUT_FORMAT in {"jpg", "png", "webp"} else "jpg"
         cmd = [
             self._binary,
             "-i", str(input_dir),
             "-o", str(output_dir),
             "-n", ANIME_MODEL,
             "-s", str(scale),
-            "-f", "png",
+            "-f", output_format,
             "-g", str(gpu_id),
+            "-j", Config.REALESRGAN_THREADS,
         ]
+        if Config.REALESRGAN_TILE_SIZE > 0:
+            cmd.extend(["-t", str(Config.REALESRGAN_TILE_SIZE)])
 
+        logger.info("Real-ESRGAN command: %s", " ".join(cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        communicate_task = asyncio.create_task(proc.communicate())
+        output_glob = f"*.{output_format}"
 
-        # Monitor output directory for progress
-        if progress_callback and total_frames > 0:
-            while proc.returncode is None:
-                await asyncio.sleep(2)
-                done = len(list(output_dir.glob("*.png")))
+        while not communicate_task.done():
+            await asyncio.sleep(2)
+            if progress_callback and total_frames > 0:
+                done = len(list(output_dir.glob(output_glob)))
                 try:
                     progress_callback(done, total_frames)
                 except Exception:
                     pass
-                # Check if process finished
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
-        else:
-            await proc.wait()
 
-        stdout_data = await proc.stdout.read() if proc.stdout else b""
-        stderr_data = await proc.stderr.read() if proc.stderr else b""
-
+        stdout_data, stderr_data = await communicate_task
         if proc.returncode != 0:
             error_msg = stderr_data.decode("utf-8", errors="replace")
             raise RuntimeError(f"Real-ESRGAN failed (exit {proc.returncode}): {error_msg}")
 
-        # Verify frames were upscaled
-        upscaled_count = len(list(output_dir.glob("*.png")))
+        upscaled_count = len(list(output_dir.glob(output_glob)))
         if upscaled_count == 0:
-            raise RuntimeError("Real-ESRGAN produced no output frames")
+            stdout_msg = stdout_data.decode("utf-8", errors="replace")
+            stderr_msg = stderr_data.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Real-ESRGAN produced no output frames. stdout={stdout_msg[:300]} stderr={stderr_msg[:300]}")
 
-        logger.info("Upscaled %d frames", upscaled_count)
+        if progress_callback and total_frames > 0:
+            progress_callback(upscaled_count, total_frames)
+        logger.info("Upscaled %d frames on GPU %s", upscaled_count, gpu_id)
 
     async def _reassemble_video(
         self,
@@ -401,6 +509,7 @@ class Upscaler:
         target_w: int,
         target_h: int,
         gpu_id: int = 0,
+        frame_ext: str = "jpg",
     ) -> None:
         """Reassemble upscaled frames into video with original audio.
         Uses GPU (NVENC) for encoding when available.
@@ -414,7 +523,7 @@ class Upscaler:
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             # Input upscaled frames
             "-framerate", str(fps),
-            "-i", str(frames_dir / "frame_%08d.png"),
+            "-i", str(frames_dir / f"frame_%08d.{frame_ext}"),
             # Input original for audio/subs
             "-i", original_input,
             # Scale to exact target (in case upscale overshot)
@@ -476,7 +585,7 @@ class Upscaler:
                 cmd_cpu = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
                     "-framerate", str(fps),
-                    "-i", str(frames_dir / "frame_%08d.png"),
+                    "-i", str(frames_dir / f"frame_%08d.{frame_ext}"),
                     "-i", original_input,
                     "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
                     "-c:v", "libx265", "-crf", "16", "-preset", "medium",

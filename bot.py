@@ -19,6 +19,7 @@ from encoder import encoder, EncodeSettings
 from queue_manager import queue_manager, Task, TaskType, TaskStatus
 from upscaler import upscaler
 from gdrive import gdrive
+from telegram_helpers import safe_edit_message_text, safe_edit_text
 from utils import (
     cleanup_files,
     format_media_info,
@@ -80,7 +81,8 @@ async def process_task(task: Task) -> None:
                 return
             if tracker.update(current): # Returns True if it's time to update
                 try:
-                    await app.edit_message_text(
+                    await safe_edit_message_text(
+                        app,
                         chat_id=task.progress_chat_id,
                         message_id=task.progress_message_id,
                         text=tracker.format_progress(task_action),
@@ -94,7 +96,8 @@ async def process_task(task: Task) -> None:
         tracker = ProgressTracker(task.settings.get("file_size", 0))
         input_path = os.path.join(Config.DOWNLOAD_DIR, f"{task.task_id}_input{Path(task.settings.get('file_name', '.mp4')).suffix}")
         
-        await app.edit_message_text(
+        await safe_edit_message_text(
+            app,
             chat_id=task.progress_chat_id,
             message_id=task.progress_message_id,
             text=f"📥 **Downloading...**\n\n📁 `{task.settings.get('file_name')}`",
@@ -126,10 +129,12 @@ async def process_task(task: Task) -> None:
                 processing_progress.last_percent = percent
                 from utils import progress_bar
                 bar = progress_bar(percent)
-                asyncio.create_task(app.edit_message_text(
+                unit_label = "steps" if task_action == "Upscaling" else "frames"
+                asyncio.create_task(safe_edit_message_text(
+                    app,
                     chat_id=task.progress_chat_id,
                     message_id=task.progress_message_id,
-                    text=f"⚙️ **{task_action}...**\n\n{bar}\n📊 Progress: `{percent:.1f}%` ({int(current)}/{int(total)} frames)",
+                    text=f"⚙️ **{task_action}...**\n\n{bar}\n📊 Progress: `{percent:.1f}%` ({int(current)}/{int(total)} {unit_label})",
                     parse_mode=enums.ParseMode.MARKDOWN
                 ))
         processing_progress.last_percent = 0
@@ -148,10 +153,11 @@ async def process_task(task: Task) -> None:
             
         elif task.task_type == TaskType.UPSCALE:
             task_action = "Upscaling"
-            await app.edit_message_text(
+            await safe_edit_message_text(
+                app,
                 chat_id=task.progress_chat_id,
                 message_id=task.progress_message_id,
-                text="🎞️ **Extracting video frames...**",
+                text="🎞️ **Preparing GPU upscaling...**",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
             output_path = await upscaler.upscale(
@@ -163,10 +169,11 @@ async def process_task(task: Task) -> None:
             
         elif task.task_type == TaskType.UPSCALE_ENCODE:
             task_action = "Upscaling"
-            await app.edit_message_text(
+            await safe_edit_message_text(
+                app,
                 chat_id=task.progress_chat_id,
                 message_id=task.progress_message_id,
-                text="🎞️ **Extracting video frames...**",
+                text="🎞️ **Preparing GPU upscaling...**",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
             upscaled_path = await upscaler.upscale(
@@ -225,7 +232,8 @@ async def process_task(task: Task) -> None:
     except Exception as e:
         logger.error("Error processing task %s: %s", task.task_id, str(e), exc_info=True)
         try:
-            await app.edit_message_text(
+            await safe_edit_message_text(
+                app,
                 chat_id=task.progress_chat_id,
                 message_id=task.progress_message_id,
                 text=f"❌ **Failed**\n\nError: `{str(e)[:200]}`",
@@ -248,7 +256,8 @@ async def upload_gdrive(task: Task, output_path: str, file_size: int) -> None:
             # Sync to async bridge for progress updates would go here, omitting for brevity
             pass
         
-        await app.edit_message_text(
+        await safe_edit_message_text(
+            app,
             chat_id=task.progress_chat_id,
             message_id=task.progress_message_id,
             text=f"📤 **Uploading to Google Drive...**\n\n💾 `{human_size(file_size)}`",
@@ -330,7 +339,7 @@ async def handle_video(client: Client, message: Message) -> None:
         
         position = await db.get_queue_position(task.task_id)
         if position > 1:
-            await progress_msg.edit_text(f"⏳ **Queued** (Position #{position})")
+            await safe_edit_text(progress_msg, f"⏳ **Queued** (Position #{position})")
             
     else:
         # Quick actions
@@ -372,15 +381,15 @@ async def on_quick_action(client: Client, query: CallbackQuery) -> None:
     if action == "upscale":
         wf["type"] = "upscale"
         set_workflow(user_id, wf)
-        await query.message.edit_text("🔍 **AI Anime Upscaling**\nChoose target resolution:", reply_markup=resolution_keyboard())
+        await safe_edit_text(query.message, "🔍 **AI Anime Upscaling**\nChoose target resolution:", reply_markup=resolution_keyboard())
     elif action == "encode":
         wf["type"] = "encode"
         set_workflow(user_id, wf)
-        await query.message.edit_text("🎬 **Video Encoding**\nChoose your codec:", reply_markup=codec_keyboard())
+        await safe_edit_text(query.message, "🎬 **Video Encoding**\nChoose your codec:", reply_markup=codec_keyboard())
     elif action == "both":
         wf["type"] = "upscale_encode"
         set_workflow(user_id, wf)
-        await query.message.edit_text("🔍🎬 **Upscale + Encode**\nChoose target resolution:", reply_markup=resolution_keyboard())
+        await safe_edit_text(query.message, "🔍🎬 **Upscale + Encode**\nChoose target resolution:", reply_markup=resolution_keyboard())
     
     await query.answer()
 
@@ -405,7 +414,7 @@ async def intercept_final_step(client: Client, query: CallbackQuery) -> None:
             if wf.get("type") == "upscale_encode" and "codec" not in wf:
                 # We need codec for upscale_encode
                 set_workflow(user_id, wf)
-                await query.message.edit_text("🎬 Choose your codec:", reply_markup=codec_keyboard())
+                await safe_edit_text(query.message, "🎬 Choose your codec:", reply_markup=codec_keyboard())
                 await query.answer()
                 return
 
@@ -417,7 +426,7 @@ async def intercept_final_step(client: Client, query: CallbackQuery) -> None:
         t_type = task_type_map.get(wf.get("type", "encode"), TaskType.ENCODE)
         priority = 10 if user_id in Config.ADMIN_IDS else 0
         
-        await query.message.edit_text("⏳ **Queuing task...**", parse_mode=enums.ParseMode.MARKDOWN)
+        await safe_edit_text(query.message, "⏳ **Queuing task...**", parse_mode=enums.ParseMode.MARKDOWN)
         
         task = Task(
             task_id=Task.generate_id(),
@@ -435,7 +444,7 @@ async def intercept_final_step(client: Client, query: CallbackQuery) -> None:
         
         position = await db.get_queue_position(task.task_id)
         if position > 1:
-            await query.message.edit_text(f"⏳ **Queued** (Position #{position})")
+            await safe_edit_text(query.message, f"⏳ **Queued** (Position #{position})")
             
         await query.answer("Task started!")
     else:

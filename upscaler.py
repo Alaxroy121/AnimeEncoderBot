@@ -295,23 +295,68 @@ class Upscaler:
                 logger.debug("Cleaned up work dir: %s", work_dir)
 
     async def _resolve_gpu_ids(self, fallback_gpu_id: int) -> list[int]:
-        """Resolve Real-ESRGAN GPU IDs from config or detected NVIDIA GPUs."""
+        """Resolve Real-ESRGAN GPU IDs from config or detected NVIDIA GPUs.
+
+        Real-ESRGAN uses Vulkan, not CUDA. The Vulkan device list may differ
+        from what ``nvidia-smi`` reports (e.g. on Kaggle the Vulkan ICD often
+        only exposes llvmpipe).  We probe Real-ESRGAN directly to find how many
+        Vulkan GPUs it actually sees and filter out software renderers.
+        """
         configured = Config.REALESRGAN_GPU_IDS.strip().lower()
         if configured and configured != "auto":
             gpu_ids = [int(item.strip()) for item in configured.split(",") if item.strip().isdigit()]
             if gpu_ids:
                 return gpu_ids
 
-        try:
-            from utils import get_gpu_count
+        # Probe Real-ESRGAN's Vulkan devices by running it with no input.
+        # It prints device lines like "[0 NVIDIA GeForce ...]" to stderr before erroring.
+        vulkan_gpu_ids = await self._probe_vulkan_gpus()
+        if vulkan_gpu_ids:
+            return vulkan_gpu_ids
 
-            gpu_count = await get_gpu_count()
-        except Exception:
-            gpu_count = 1
-
-        if gpu_count > 0:
-            return list(range(gpu_count))
+        # Fallback: use a single GPU 0
+        logger.warning("Could not detect Vulkan GPUs for Real-ESRGAN, falling back to GPU %d", fallback_gpu_id)
         return [fallback_gpu_id]
+
+    async def _probe_vulkan_gpus(self) -> list[int]:
+        """Run Real-ESRGAN with bogus args to list Vulkan devices.
+
+        Parse stderr for device lines like ``[0 NVIDIA Tesla T4]`` and skip
+        software renderers (llvmpipe, SwiftShader, lavapipe).
+        """
+        import re as _re
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._binary, "-i", ".", "-o", ".", "-n", "realesr-animevideov3",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            output = stderr.decode("utf-8", errors="replace")
+
+            software_renderers = {"llvmpipe", "swiftshader", "lavapipe"}
+            gpu_ids: list[int] = []
+
+            for match in _re.finditer(r"\[(\d+)\s+([^\]]+)\]", output):
+                dev_id = int(match.group(1))
+                dev_name = match.group(2).strip().lower()
+                if any(sw in dev_name for sw in software_renderers):
+                    logger.info("Skipping software Vulkan device %d: %s", dev_id, match.group(2).strip())
+                    continue
+                gpu_ids.append(dev_id)
+
+            if gpu_ids:
+                logger.info("Detected Real-ESRGAN Vulkan GPUs: %s", gpu_ids)
+            else:
+                logger.warning(
+                    "Real-ESRGAN found no hardware Vulkan GPUs (only software renderers). "
+                    "Ensure NVIDIA Vulkan ICD is installed (libnvidia-gl, nvidia-vulkan-icd)."
+                )
+            return gpu_ids
+        except Exception as e:
+            logger.warning("Failed to probe Real-ESRGAN Vulkan devices: %s", e)
+            return []
 
     @staticmethod
     def _resolve_parallel_jobs(gpu_ids: list[int], expected_segments: int) -> int:

@@ -17,3 +17,9 @@ aiofiles>=23.0.0
 
 # HTTP client (for webhook/API calls if needed)
 aiohttp>=3.9.0
+
+# PyTorch Real-ESRGAN (CUDA fallback — install on Kaggle/CUDA-only systems)
+# realesrgan>=0.3.0
+# basicsr>=1.4.2
+# facexlib>=0.3.0
+# gfpgan>=1.3.8

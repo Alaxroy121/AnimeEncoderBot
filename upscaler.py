@@ -34,26 +34,71 @@ ANIME_MODEL = "realesr-animevideov3"
 
 
 class Upscaler:
-    """Real-ESRGAN based anime video upscaler."""
+    """Real-ESRGAN based anime video upscaler.
+
+    Supports two backends:
+      - **ncnn**: realesrgan-ncnn-vulkan binary (requires Vulkan GPU drivers)
+      - **pytorch**: realesrgan Python package with CUDA (fallback for Kaggle/CUDA-only)
+    """
 
     def __init__(self) -> None:
         self._binary: str = Config.REALESRGAN_PATH
         self._available: Optional[bool] = None
+        self._backend: Optional[str] = None  # "ncnn" | "pytorch" | None
+
+    @property
+    def backend(self) -> Optional[str]:
+        return self._backend
 
     async def check_available(self) -> bool:
-        """Check if Real-ESRGAN binary is available."""
+        """Detect which Real-ESRGAN backend is usable.
+
+        Priority:
+          1. ncnn-vulkan binary with real hardware Vulkan GPUs
+          2. PyTorch realesrgan package with CUDA
+          3. Not available
+        """
         if self._available is not None:
             return self._available
-        self._available = shutil.which(self._binary) is not None
-        if not self._available:
-            # Try alternative paths
+
+        # --- Try ncnn-vulkan binary ---
+        binary_found = shutil.which(self._binary) is not None
+        if not binary_found:
             for alt in ["/usr/local/bin/realesrgan-ncnn-vulkan", "./realesrgan-ncnn-vulkan"]:
                 if Path(alt).exists():
                     self._binary = alt
-                    self._available = True
+                    binary_found = True
                     break
-        logger.info("Real-ESRGAN available: %s (path: %s)", self._available, self._binary)
-        return self._available
+
+        if binary_found:
+            hw_gpus = await self._probe_vulkan_gpus()
+            if hw_gpus:
+                self._backend = "ncnn"
+                self._available = True
+                logger.info("Real-ESRGAN backend: ncnn-vulkan (binary: %s, GPUs: %s)", self._binary, hw_gpus)
+                return True
+            else:
+                logger.info("ncnn-vulkan binary found but no hardware Vulkan GPUs — skipping ncnn backend")
+
+        # --- Try PyTorch backend ---
+        try:
+            import torch
+            if torch.cuda.is_available():
+                import realesrgan  # noqa: F401
+                self._backend = "pytorch"
+                self._available = True
+                logger.info(
+                    "Real-ESRGAN backend: pytorch (CUDA devices: %d)", torch.cuda.device_count()
+                )
+                return True
+            else:
+                logger.info("PyTorch available but CUDA not accessible — skipping pytorch backend")
+        except ImportError:
+            logger.info("PyTorch realesrgan package not installed — skipping pytorch backend")
+
+        self._available = False
+        logger.warning("Real-ESRGAN not available (no usable backend found)")
+        return False
 
     @staticmethod
     def calculate_scale_factor(
@@ -295,12 +340,10 @@ class Upscaler:
                 logger.debug("Cleaned up work dir: %s", work_dir)
 
     async def _resolve_gpu_ids(self, fallback_gpu_id: int) -> list[int]:
-        """Resolve Real-ESRGAN GPU IDs from config or detected NVIDIA GPUs.
+        """Resolve GPU IDs based on the active backend.
 
-        Real-ESRGAN uses Vulkan, not CUDA. The Vulkan device list may differ
-        from what ``nvidia-smi`` reports (e.g. on Kaggle the Vulkan ICD often
-        only exposes llvmpipe).  We probe Real-ESRGAN directly to find how many
-        Vulkan GPUs it actually sees and filter out software renderers.
+        - ncnn backend: probe Vulkan devices (Real-ESRGAN uses Vulkan, not CUDA)
+        - pytorch backend: use ``torch.cuda.device_count()``
         """
         configured = Config.REALESRGAN_GPU_IDS.strip().lower()
         if configured and configured != "auto":
@@ -308,13 +351,21 @@ class Upscaler:
             if gpu_ids:
                 return gpu_ids
 
-        # Probe Real-ESRGAN's Vulkan devices by running it with no input.
-        # It prints device lines like "[0 NVIDIA GeForce ...]" to stderr before erroring.
+        if self._backend == "pytorch":
+            import torch
+            count = torch.cuda.device_count()
+            if count > 0:
+                gpu_ids = list(range(count))
+                logger.info("PyTorch CUDA devices: %s", gpu_ids)
+                return gpu_ids
+            logger.warning("PyTorch backend but no CUDA devices, falling back to GPU %d", fallback_gpu_id)
+            return [fallback_gpu_id]
+
+        # ncnn backend: probe Vulkan devices
         vulkan_gpu_ids = await self._probe_vulkan_gpus()
         if vulkan_gpu_ids:
             return vulkan_gpu_ids
 
-        # Fallback: use a single GPU 0
         logger.warning("Could not detect Vulkan GPUs for Real-ESRGAN, falling back to GPU %d", fallback_gpu_id)
         return [fallback_gpu_id]
 
@@ -498,7 +549,26 @@ class Upscaler:
         total_frames: int = 0,
         gpu_id: int = 0,
     ) -> None:
-        """Run Real-ESRGAN on extracted frames with tuned Vulkan options."""
+        """Dispatch frame upscaling to the active backend."""
+        if self._backend == "pytorch":
+            await self._upscale_frames_pytorch(
+                input_dir, output_dir, scale, progress_callback, total_frames, gpu_id,
+            )
+        else:
+            await self._upscale_frames_ncnn(
+                input_dir, output_dir, scale, progress_callback, total_frames, gpu_id,
+            )
+
+    async def _upscale_frames_ncnn(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        scale: int = 4,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        total_frames: int = 0,
+        gpu_id: int = 0,
+    ) -> None:
+        """Run Real-ESRGAN ncnn-vulkan binary on extracted frames."""
         output_format = Config.REALESRGAN_OUTPUT_FORMAT if Config.REALESRGAN_OUTPUT_FORMAT in {"jpg", "png", "webp"} else "jpg"
         cmd = [
             self._binary,
@@ -513,7 +583,7 @@ class Upscaler:
         if Config.REALESRGAN_TILE_SIZE > 0:
             cmd.extend(["-t", str(Config.REALESRGAN_TILE_SIZE)])
 
-        logger.info("Real-ESRGAN command: %s", " ".join(cmd))
+        logger.info("Real-ESRGAN ncnn command: %s", " ".join(cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -534,17 +604,117 @@ class Upscaler:
         stdout_data, stderr_data = await communicate_task
         if proc.returncode != 0:
             error_msg = stderr_data.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Real-ESRGAN failed (exit {proc.returncode}): {error_msg}")
+            raise RuntimeError(f"Real-ESRGAN ncnn failed (exit {proc.returncode}): {error_msg}")
 
         upscaled_count = len(list(output_dir.glob(output_glob)))
         if upscaled_count == 0:
             stdout_msg = stdout_data.decode("utf-8", errors="replace")
             stderr_msg = stderr_data.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Real-ESRGAN produced no output frames. stdout={stdout_msg[:300]} stderr={stderr_msg[:300]}")
+            raise RuntimeError(f"Real-ESRGAN ncnn produced no output frames. stdout={stdout_msg[:300]} stderr={stderr_msg[:300]}")
 
         if progress_callback and total_frames > 0:
             progress_callback(upscaled_count, total_frames)
-        logger.info("Upscaled %d frames on GPU %s", upscaled_count, gpu_id)
+        logger.info("Upscaled %d frames on GPU %s (ncnn)", upscaled_count, gpu_id)
+
+    async def _upscale_frames_pytorch(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        scale: int = 4,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        total_frames: int = 0,
+        gpu_id: int = 0,
+    ) -> None:
+        """Run Real-ESRGAN via PyTorch/CUDA on extracted frames."""
+        import cv2
+        import numpy as np
+        import torch
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
+
+        output_format = Config.REALESRGAN_OUTPUT_FORMAT if Config.REALESRGAN_OUTPUT_FORMAT in {"jpg", "png", "webp"} else "jpg"
+
+        # Set CUDA device for this segment
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+        logger.info("Real-ESRGAN pytorch: GPU %d, scale %dx", gpu_id, scale)
+
+        # Build model — realesr-animevideov3 uses a compact RRDBNet
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=scale)
+
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=None,  # will auto-download
+            model=model,
+            tile=Config.REALESRGAN_TILE_SIZE if Config.REALESRGAN_TILE_SIZE > 0 else 0,
+            tile_pad=10,
+            pre_pad=0,
+            half=True,  # fp16 for speed on consumer GPUs
+            device=device,
+        )
+
+        # Auto-download the model weights if model_path=None doesn't work;
+        # RealESRGANer needs a valid model_path. Provide the known URL.
+        model_url = (
+            f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+            f"realesr-animevideov3.pth"
+        )
+        # Re-create with explicit model_path
+        import urllib.request
+        model_dir = Path.home() / ".cache" / "realesrgan"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_path = model_dir / "realesr-animevideov3.pth"
+        if not model_path.exists():
+            logger.info("Downloading realesr-animevideov3 model weights...")
+            await asyncio.get_event_loop().run_in_executor(
+                None, urllib.request.urlretrieve, model_url, str(model_path),
+            )
+            logger.info("Model downloaded to %s", model_path)
+
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=str(model_path),
+            model=model,
+            tile=Config.REALESRGAN_TILE_SIZE if Config.REALESRGAN_TILE_SIZE > 0 else 0,
+            tile_pad=10,
+            pre_pad=0,
+            half=True,
+            device=device,
+        )
+
+        frame_files = sorted(input_dir.glob("frame_*.jpg"))
+        upscaled_count = 0
+
+        for frame_file in frame_files:
+            img = cv2.imread(str(frame_file), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                logger.warning("Could not read frame: %s", frame_file)
+                continue
+
+            # RealESRGANer.enhance expects BGR numpy array
+            output, _ = upsampler.enhance(img, outscale=scale)
+
+            out_name = frame_file.stem + f".{output_format}"
+            out_path = output_dir / out_name
+            cv2.imwrite(str(out_path), output)
+            upscaled_count += 1
+
+            if progress_callback and total_frames > 0:
+                try:
+                    progress_callback(upscaled_count, total_frames)
+                except Exception:
+                    pass
+
+        # Free VRAM
+        del upsampler
+        torch.cuda.empty_cache()
+
+        if upscaled_count == 0:
+            raise RuntimeError("Real-ESRGAN pytorch produced no output frames")
+
+        if progress_callback and total_frames > 0:
+            progress_callback(upscaled_count, total_frames)
+        logger.info("Upscaled %d frames on GPU %s (pytorch)", upscaled_count, gpu_id)
 
     async def _reassemble_video(
         self,

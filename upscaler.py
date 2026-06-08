@@ -84,6 +84,15 @@ class Upscaler:
         try:
             import torch
             if torch.cuda.is_available():
+                # Fix: basicsr uses torchvision.transforms.functional_tensor
+                # which was removed in newer torchvision versions
+                try:
+                    import torchvision.transforms.functional_tensor  # noqa: F401
+                except ModuleNotFoundError:
+                    import sys
+                    import torchvision.transforms.functional as _functional
+                    sys.modules["torchvision.transforms.functional_tensor"] = _functional
+                    logger.info("Patched torchvision.transforms.functional_tensor compatibility shim")
                 import realesrgan  # noqa: F401
                 self._backend = "pytorch"
                 self._available = True

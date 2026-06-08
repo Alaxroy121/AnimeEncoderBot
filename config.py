@@ -58,8 +58,15 @@ class Config:
     # Task timeout (seconds) — 6 hours default
     TASK_TIMEOUT: int = int(os.getenv("TASK_TIMEOUT", "21600"))
 
-    # Real-ESRGAN binary path
+    # Real-ESRGAN binary path and performance tuning
     REALESRGAN_PATH: str = os.getenv("REALESRGAN_PATH", "realesrgan-ncnn-vulkan")
+    REALESRGAN_GPU_IDS: str = os.getenv("REALESRGAN_GPU_IDS", "auto")  # auto, 0, or 0,1
+    REALESRGAN_THREADS: str = os.getenv("REALESRGAN_THREADS", "2:4:2")  # load:process:save
+    REALESRGAN_TILE_SIZE: int = int(os.getenv("REALESRGAN_TILE_SIZE", "0"))  # 0 = auto
+    REALESRGAN_OUTPUT_FORMAT: str = os.getenv("REALESRGAN_OUTPUT_FORMAT", "jpg").lower()
+    UPSCALE_SEGMENT_SECONDS: int = int(os.getenv("UPSCALE_SEGMENT_SECONDS", "10"))
+    UPSCALE_PARALLEL_JOBS: int = int(os.getenv("UPSCALE_PARALLEL_JOBS", "0"))  # 0 = one job per GPU
+    UPSCALE_JOBS_PER_GPU: int = int(os.getenv("UPSCALE_JOBS_PER_GPU", "1"))
 
     # Supported video extensions
     SUPPORTED_EXTENSIONS: set[str] = {

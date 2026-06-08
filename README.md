@@ -176,6 +176,11 @@ Edit `config.env` with your values:
 | `DEFAULT_CODEC` | Default codec: `av1` or `hevc` | `hevc` |
 | `GPU_ENABLED` | Enable GPU acceleration | `true` |
 | `CONCURRENT_TASKS` | Max simultaneous tasks | `2` |
+| `REALESRGAN_GPU_IDS` | GPU IDs for Real-ESRGAN upscaling (`auto` uses every detected GPU) | `auto` |
+| `UPSCALE_PARALLEL_JOBS` | Parallel Real-ESRGAN segment jobs (`0` = one job per GPU) | `0` |
+| `UPSCALE_SEGMENT_SECONDS` | Segment length for parallel upscaling; smaller starts GPU work sooner | `10` |
+| `REALESRGAN_THREADS` | Real-ESRGAN load/process/save thread tuning | `2:4:2` |
+| `REALESRGAN_OUTPUT_FORMAT` | Upscaled frame format; `jpg` is faster/lower disk than `png` | `jpg` |
 
 ---
 

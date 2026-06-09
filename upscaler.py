@@ -651,22 +651,21 @@ class Upscaler:
         # Build model — realesr-animevideov3 uses a compact RRDBNet
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=scale)
 
+        # RealESRGANer requires an explicit model_path (URL or local file)
+        model_url = (
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+            "realesr-animevideov3.pth"
+        )
+
         upsampler = RealESRGANer(
             scale=scale,
-            model_path=None,  # will auto-download
+            model_path=model_url,
             model=model,
             tile=Config.REALESRGAN_TILE_SIZE if Config.REALESRGAN_TILE_SIZE > 0 else 0,
             tile_pad=10,
             pre_pad=0,
             half=True,  # fp16 for speed on consumer GPUs
             device=device,
-        )
-
-        # Auto-download the model weights if model_path=None doesn't work;
-        # RealESRGANer needs a valid model_path. Provide the known URL.
-        model_url = (
-            f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
-            f"realesr-animevideov3.pth"
         )
         # Re-create with explicit model_path
         import urllib.request

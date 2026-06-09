@@ -752,34 +752,15 @@ class Upscaler:
             "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
         ]
 
-        if has_nvenc:
-            # GPU-accelerated encoding for reassembly
-            logger.info(f"Reassembling with HEVC NVENC (GPU {gpu_id})")
-            cmd.extend([
-                "-c:v", "hevc_nvenc",
-                "-preset", "p5",
-                "-tune", "hq",
-                "-rc", "vbr",
-                "-cq", "18",
-                "-b:v", "0",
-                "-maxrate", "30M",
-                "-bufsize", "60M",
-                "-spatial_aq", "1",
-                "-temporal_aq", "1",
-                "-rc-lookahead", "32",
-                "-profile:v", "main10",
-            ])
-            if gpu_id is not None:
-                cmd.extend(["-gpu", str(gpu_id)])
-        else:
-            # CPU fallback
-            logger.warning("Reassembling with libx265 (CPU) — no GPU available")
-            cmd.extend([
-                "-c:v", "libx265",
-                "-crf", "16",
-                "-preset", "medium",
-                "-pix_fmt", "yuv420p10le",
-            ])
+        # Use lossless intermediate so the final encode (encoder.py) controls quality.
+        # Avoids double-encoding HEVC → HEVC which destroys bitrate.
+        logger.info(f"Reassembling with lossless H.264 intermediate (GPU {gpu_id})")
+        cmd.extend([
+            "-c:v", "libx264",
+            "-crf", "0",
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+        ])
 
         cmd.extend([
             # Copy audio from original

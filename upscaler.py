@@ -638,7 +638,7 @@ class Upscaler:
         import cv2
         import numpy as np
         import torch
-        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan.archs.srvgg_arch import SRVGGNetCompact
         from realesrgan import RealESRGANer
 
         output_format = Config.REALESRGAN_OUTPUT_FORMAT if Config.REALESRGAN_OUTPUT_FORMAT in {"jpg", "png", "webp"} else "jpg"
@@ -648,8 +648,8 @@ class Upscaler:
         device = torch.device(f"cuda:{gpu_id}")
         logger.info("Real-ESRGAN pytorch: GPU %d, scale %dx", gpu_id, scale)
 
-        # Build model — realesr-animevideov3 uses a compact RRDBNet
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=scale)
+        # Build model — realesr-animevideov3 uses SRVGGNetCompact (not RRDBNet)
+        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=scale, act_type='prelu')
 
         # RealESRGANer requires an explicit model_path (URL or local file)
         model_url = (

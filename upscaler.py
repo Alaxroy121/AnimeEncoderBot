@@ -5,6 +5,7 @@ Pipeline: extract frames → upscale → reassemble with audio.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import math
 import os
@@ -634,7 +635,12 @@ class Upscaler:
         total_frames: int = 0,
         gpu_id: int = 0,
     ) -> None:
-        """Run Real-ESRGAN via PyTorch/CUDA on extracted frames."""
+        """Run Real-ESRGAN via PyTorch/CUDA on extracted frames.
+
+        The heavy enhance() loop is offloaded to a thread so it doesn't
+        block the asyncio event loop — this is critical for true parallel
+        GPU utilisation when multiple segments are processed via gather().
+        """
         import cv2
         import numpy as np
         import torch
@@ -643,32 +649,12 @@ class Upscaler:
 
         output_format = Config.REALESRGAN_OUTPUT_FORMAT if Config.REALESRGAN_OUTPUT_FORMAT in {"jpg", "png", "webp"} else "jpg"
 
-        # Set CUDA device for this segment
-        torch.cuda.set_device(gpu_id)
-        device = torch.device(f"cuda:{gpu_id}")
-        logger.info("Real-ESRGAN pytorch: GPU %d, scale %dx", gpu_id, scale)
-
-        # Build model — realesr-animevideov3 uses SRVGGNetCompact (not RRDBNet)
-        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=scale, act_type='prelu')
-
-        # RealESRGANer requires an explicit model_path (URL or local file)
+        # Download model weights if needed (before entering thread)
+        import urllib.request
         model_url = (
             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
             "realesr-animevideov3.pth"
         )
-
-        upsampler = RealESRGANer(
-            scale=scale,
-            model_path=model_url,
-            model=model,
-            tile=Config.REALESRGAN_TILE_SIZE if Config.REALESRGAN_TILE_SIZE > 0 else 0,
-            tile_pad=10,
-            pre_pad=0,
-            half=True,  # fp16 for speed on consumer GPUs
-            device=device,
-        )
-        # Re-create with explicit model_path
-        import urllib.request
         model_dir = Path.home() / ".cache" / "realesrgan"
         model_dir.mkdir(parents=True, exist_ok=True)
         model_path = model_dir / "realesr-animevideov3.pth"
@@ -679,43 +665,55 @@ class Upscaler:
             )
             logger.info("Model downloaded to %s", model_path)
 
-        upsampler = RealESRGANer(
-            scale=scale,
-            model_path=str(model_path),
-            model=model,
-            tile=Config.REALESRGAN_TILE_SIZE if Config.REALESRGAN_TILE_SIZE > 0 else 0,
-            tile_pad=10,
-            pre_pad=0,
-            half=True,
-            device=device,
-        )
+        def _blocking_upscale() -> int:
+            """Runs in a thread — does all the heavy GPU work."""
+            torch.cuda.set_device(gpu_id)
+            device = torch.device(f"cuda:{gpu_id}")
+            logger.info("Real-ESRGAN pytorch: GPU %d, scale %dx", gpu_id, scale)
 
-        frame_files = sorted(input_dir.glob("frame_*.jpg"))
-        upscaled_count = 0
+            model = SRVGGNetCompact(
+                num_in_ch=3, num_out_ch=3, num_feat=64,
+                num_conv=16, upscale=scale, act_type='prelu',
+            )
+            upsampler = RealESRGANer(
+                scale=scale,
+                model_path=str(model_path),
+                model=model,
+                tile=Config.REALESRGAN_TILE_SIZE if Config.REALESRGAN_TILE_SIZE > 0 else 0,
+                tile_pad=10,
+                pre_pad=0,
+                half=True,
+                device=device,
+            )
 
-        for frame_file in frame_files:
-            img = cv2.imread(str(frame_file), cv2.IMREAD_UNCHANGED)
-            if img is None:
-                logger.warning("Could not read frame: %s", frame_file)
-                continue
+            frame_files = sorted(input_dir.glob("frame_*.jpg"))
+            upscaled_count = 0
 
-            # RealESRGANer.enhance expects BGR numpy array
-            output, _ = upsampler.enhance(img, outscale=scale)
+            for frame_file in frame_files:
+                img = cv2.imread(str(frame_file), cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    logger.warning("Could not read frame: %s", frame_file)
+                    continue
 
-            out_name = frame_file.stem + f".{output_format}"
-            out_path = output_dir / out_name
-            cv2.imwrite(str(out_path), output)
-            upscaled_count += 1
+                output, _ = upsampler.enhance(img, outscale=scale)
 
-            if progress_callback and total_frames > 0:
-                try:
-                    progress_callback(upscaled_count, total_frames)
-                except Exception:
-                    pass
+                out_name = frame_file.stem + f".{output_format}"
+                out_path = output_dir / out_name
+                cv2.imwrite(str(out_path), output)
+                upscaled_count += 1
 
-        # Free VRAM
-        del upsampler
-        torch.cuda.empty_cache()
+                if progress_callback and total_frames > 0:
+                    try:
+                        progress_callback(upscaled_count, total_frames)
+                    except Exception:
+                        pass
+
+            del upsampler
+            torch.cuda.empty_cache()
+            return upscaled_count
+
+        loop = asyncio.get_event_loop()
+        upscaled_count = await loop.run_in_executor(None, _blocking_upscale)
 
         if upscaled_count == 0:
             raise RuntimeError("Real-ESRGAN pytorch produced no output frames")

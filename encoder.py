@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 # ── Quality / Preset Maps ────────────────────────────────────────────
 
 QUALITY_MAP = {
-    "low":    {"hevc_crf": 30, "hevc_cq": 32, "av1_crf": 38, "av1_cq": 38},
-    "medium": {"hevc_crf": 24, "hevc_cq": 26, "av1_crf": 30, "av1_cq": 30},
-    "high":   {"hevc_crf": 20, "hevc_cq": 22, "av1_crf": 24, "av1_cq": 24},
-    "ultra":  {"hevc_crf": 16, "hevc_cq": 18, "av1_crf": 18, "av1_cq": 18},
+    "low":    {"hevc_crf": 26, "hevc_cq": 26, "av1_crf": 32, "av1_cq": 32},
+    "medium": {"hevc_crf": 20, "hevc_cq": 18, "av1_crf": 24, "av1_cq": 24},
+    "high":   {"hevc_crf": 18, "hevc_cq": 16, "av1_crf": 20, "av1_cq": 20},
+    "ultra":  {"hevc_crf": 14, "hevc_cq": 14, "av1_crf": 16, "av1_cq": 16},
 }
 
 # NVENC presets (P1-P7, higher = slower + better quality)
@@ -222,8 +222,8 @@ class Encoder:
             "-rc", "vbr",
             "-cq", str(cq),
             "-b:v", "0",
-            "-maxrate", "20M",
-            "-bufsize", "40M",
+            "-maxrate", "100M",
+            "-bufsize", "200M",
             "-spatial_aq", "1",
             "-temporal_aq", "1",
             "-rc-lookahead", "32",
@@ -247,8 +247,8 @@ class Encoder:
             "-rc", "vbr",
             "-cq", str(cq),
             "-b:v", "0",
-            "-maxrate", "20M",
-            "-bufsize", "40M",
+            "-maxrate", "100M",
+            "-bufsize", "200M",
             "-spatial_aq", "1",
             "-temporal_aq", "1",
             "-rc-lookahead", "32",

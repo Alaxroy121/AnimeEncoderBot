@@ -478,7 +478,7 @@ async def on_startup() -> None:
                 encoder.gpu_name, encoder.gpu_available, encoder.has_av1_nvenc)
 
     await upscaler.check_available()
-    logger.info("Real-ESRGAN: %s", "available" if upscaler._available else "NOT FOUND")
+    logger.info("Real-CUGAN: %s", "available" if upscaler._available else "NOT FOUND")
 
     logger.info("GDrive: %s", "configured" if gdrive.is_configured() else "not configured")
 

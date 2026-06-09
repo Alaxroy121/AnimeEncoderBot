@@ -58,7 +58,7 @@ class Config:
     # Task timeout (seconds) — 6 hours default
     TASK_TIMEOUT: int = int(os.getenv("TASK_TIMEOUT", "21600"))
 
-    # Real-ESRGAN binary path and performance tuning
+    # Real-CUGAN binary path and performance tuning
     REALESRGAN_PATH: str = os.getenv("REALESRGAN_PATH", "realesrgan-ncnn-vulkan")
     REALESRGAN_GPU_IDS: str = os.getenv("REALESRGAN_GPU_IDS", "auto")  # auto, 0, or 0,1
     REALESRGAN_THREADS: str = os.getenv("REALESRGAN_THREADS", "2:4:2")  # load:process:save

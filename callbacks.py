@@ -278,7 +278,7 @@ def register_callbacks(app: Client) -> None:
             query.message,
             f"🔍 **Upscaling Settings**\n\n"
             f"📐 Target: **{resolution.upper()}** ({label})\n"
-            f"🤖 Model: **Real-ESRGAN (Anime V3)**\n\n"
+            f"🤖 Model: **Real-CUGAN (Anime)**\n\n"
             "Send the video file to start upscaling, or press Cancel.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel_workflow")],

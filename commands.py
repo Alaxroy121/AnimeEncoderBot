@@ -100,7 +100,7 @@ def register_commands(app: Client) -> None:
             f"👋 **Hello {user.first_name}!**\n\n"
             f"🎬 I am **AnimeEncoderBot**\n"
             f"_Professional AI-Enhanced Video Encoding._\n\n"
-            f"> 🧠 AI Upscaling: Real-ESRGAN (Anime V3)\n"
+            f"> 🧠 AI Upscaling: Real-CUGAN (Anime)\n"
             f"> 🎬 Codecs: H.265 (HEVC) / AV1\n"
             f"> 📺 Resolution: Up to 8K\n"
             f"> ⚡ GPU Accelerated: {gpu_status}\n"
@@ -144,7 +144,7 @@ def register_commands(app: Client) -> None:
             "├ /upscale — AI upscale (anime optimized)\n"
             "│   Choose resolution → send video\n"
             "│   Targets: 1080p, 2K, 4K, 8K\n"
-            "│   Model: Real-ESRGAN Anime V3\n"
+            "│   Model: Real-CUGAN Anime\n"
             "│\n"
             "**General Commands**\n"
             "├ /status — Check your current task\n"
@@ -222,7 +222,7 @@ def register_commands(app: Client) -> None:
         if not await upscaler.check_available():
             await message.reply_text(
                 "❌ **Upscaler Not Available**\n\n"
-                "Real-ESRGAN is not installed on this server.\n"
+                "Real-CUGAN is not installed on this server.\n"
                 "Contact the admin to set it up."
             )
             return
@@ -231,7 +231,7 @@ def register_commands(app: Client) -> None:
 
         await message.reply_text(
             "🔍 **AI Anime Upscaling**\n\n"
-            "Using **Real-ESRGAN Anime V3** model.\n\n"
+            "Using **Real-CUGAN Anime** model.\n\n"
             "Choose target resolution:",
             reply_markup=resolution_keyboard(),
         )

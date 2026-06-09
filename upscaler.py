@@ -28,7 +28,9 @@ RESOLUTION_MAP: dict[str, tuple[int, int]] = {
 }
 
 # Real-ESRGAN scale factors supported
-SUPPORTED_SCALES = [2, 3, 4]
+# realesr-animevideov3.pth only supports 4x — always upscale 4x,
+# then downscale to target resolution during reassembly.
+SUPPORTED_SCALES = [4]
 
 # Model names
 ANIME_MODEL = "realesr-animevideov3"

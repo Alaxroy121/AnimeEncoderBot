@@ -182,31 +182,44 @@ class Upscaler:
             upscale_progress: list[int] = [0] * len(segment_files)
             progress_lock = asyncio.Lock()
 
-            async def update_progress(index: int, phase: str, done_in_segment: int, segment_frames: int) -> None:
+            def fire_progress(index: int, phase: str, done_in_segment: int, segment_frames: int) -> None:
+                """Synchronous progress update — avoids unawaited coroutine warnings."""
                 if not progress_callback or total_frames <= 0:
                     return
-                async with progress_lock:
-                    if phase == "extract":
-                        extract_progress[index] = min(segment_frames, max(extract_progress[index], done_in_segment))
-                    else:
-                        extract_progress[index] = max(extract_progress[index], segment_frames)
-                        upscale_progress[index] = min(segment_frames, max(upscale_progress[index], done_in_segment))
-                    done = min(sum(extract_progress) + sum(upscale_progress), total_work_units)
+                if phase == "extract":
+                    extract_progress[index] = min(segment_frames, max(extract_progress[index], done_in_segment))
+                else:
+                    extract_progress[index] = max(extract_progress[index], segment_frames)
+                    upscale_progress[index] = min(segment_frames, max(upscale_progress[index], done_in_segment))
+                done = min(sum(extract_progress) + sum(upscale_progress), total_work_units)
                 try:
                     progress_callback(done, total_work_units)
                 except Exception:
                     pass
 
-            semaphore = asyncio.Semaphore(parallel_jobs)
+            # ── Queue-based GPU workers for true parallelism ──────────────────
+            # Each GPU gets its own worker that continuously pulls segments from
+            # a shared queue. This ensures GPUs don't wait for each other.
+            segment_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+            for i, seg in enumerate(segment_files):
+                await segment_queue.put((i, seg))
 
-            async def process_segment(index: int, segment_file: Path) -> tuple[int, Path, int]:
-                async with semaphore:
-                    assigned_gpu = gpu_ids[index % len(gpu_ids)]
+            results: list[tuple[int, Path, int]] = []
+            results_lock = asyncio.Lock()
+
+            async def gpu_worker(worker_gpu: int) -> None:
+                """Worker loop: pull segments from queue and process on assigned GPU."""
+                while True:
+                    try:
+                        index, segment_file = segment_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return  # No more work
+
                     logger.info(
                         "Processing segment %d/%d on GPU %s: %s",
                         index + 1,
                         len(segment_files),
-                        assigned_gpu,
+                        worker_gpu,
                         segment_file.name,
                     )
 
@@ -227,9 +240,7 @@ class Upscaler:
                             str(segment_file),
                             part_frames_dir,
                             expected_frames=expected_segment_frames,
-                            progress_callback=lambda done, _total: asyncio.create_task(
-                                update_progress(index, "extract", done, expected_segment_frames)
-                            ),
+                            progress_callback=lambda done, _total, idx=index, exp=expected_segment_frames: fire_progress(idx, "extract", done, exp),
                         )
                         if extracted_frames == 0:
                             raise RuntimeError(f"Segment {segment_file.name} had 0 frames")
@@ -244,11 +255,9 @@ class Upscaler:
                             part_frames_dir,
                             part_upscaled_dir,
                             scale=scale,
-                            progress_callback=lambda done, _total: asyncio.create_task(
-                                update_progress(index, "upscale", done, extracted_frames)
-                            ),
+                            progress_callback=lambda done, _total, idx=index, ef=extracted_frames: fire_progress(idx, "upscale", done, ef),
                             total_frames=extracted_frames,
-                            gpu_id=assigned_gpu,
+                            gpu_id=worker_gpu,
                         )
 
                         await self._reassemble_video(
@@ -258,23 +267,24 @@ class Upscaler:
                             fps,
                             target_w,
                             target_h,
-                            gpu_id=assigned_gpu,
+                            gpu_id=worker_gpu,
                             frame_ext=Config.REALESRGAN_OUTPUT_FORMAT,
                         )
 
                         if not part_output_path.exists():
                             raise RuntimeError(f"Segment reassembly failed for {segment_file.name}")
 
-                        await update_progress(index, "upscale", extracted_frames, extracted_frames)
-                        return index, part_output_path, extracted_frames
+                        fire_progress(index, "upscale", extracted_frames, extracted_frames)
+
+                        async with results_lock:
+                            results.append((index, part_output_path, extracted_frames))
 
                     finally:
                         shutil.rmtree(part_frames_dir, ignore_errors=True)
                         shutil.rmtree(part_upscaled_dir, ignore_errors=True)
 
-            results = await asyncio.gather(
-                *(process_segment(i, segment_file) for i, segment_file in enumerate(segment_files))
-            )
+            # Start one worker per GPU — they run truly in parallel
+            await asyncio.gather(*(gpu_worker(g) for g in gpu_ids))
             results.sort(key=lambda item: item[0])
             upscaled_segments = [path for _, path, _ in results]
 

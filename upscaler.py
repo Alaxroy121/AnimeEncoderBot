@@ -234,6 +234,12 @@ class Upscaler:
                         if extracted_frames == 0:
                             raise RuntimeError(f"Segment {segment_file.name} had 0 frames")
 
+                        # Delete input segment after extraction to free disk space
+                        try:
+                            segment_file.unlink()
+                        except OSError:
+                            pass
+
                         await self._upscale_frames(
                             part_frames_dir,
                             part_upscaled_dir,
@@ -585,12 +591,12 @@ class Upscaler:
             "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
         ]
 
-        # Use lossless intermediate so the final encode (encoder.py) controls quality.
-        # Avoids double-encoding HEVC → HEVC which destroys bitrate.
-        logger.info(f"Reassembling with lossless H.264 intermediate (GPU {gpu_id})")
+        # Use near-lossless H.264 intermediate so encoder.py controls final quality.
+        # -crf 4 is visually lossless but MUCH smaller than -crf 0 (saves disk space).
+        logger.info(f"Reassembling with near-lossless H.264 intermediate (GPU {gpu_id})")
         cmd.extend([
             "-c:v", "libx264",
-            "-crf", "0",
+            "-crf", "4",
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
         ])
@@ -624,8 +630,8 @@ class Upscaler:
                     "-i", str(frames_dir / f"frame_%08d.{frame_ext}"),
                     "-i", original_input,
                     "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
-                    "-c:v", "libx265", "-crf", "16", "-preset", "medium",
-                    "-pix_fmt", "yuv420p10le",
+                    "-c:v", "libx264", "-crf", "4", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p",
                     "-c:a", "copy", "-c:s", "copy",
                     "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
                     output_path,

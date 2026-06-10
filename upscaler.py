@@ -31,8 +31,7 @@ RESOLUTION_MAP: dict[str, tuple[int, int]] = {
 # Real-CUGAN natively supports 2x, 3x, 4x
 SUPPORTED_SCALES = [2, 3, 4]
 
-# Real-CUGAN weight URL pattern
-CUGAN_WEIGHT_URL = "https://github.com/bilibili/ailab/releases/download/Real-CUGAN/up{scale}x-latest-denoise3x.pth"
+# Real-CUGAN weights are bundled in the repo's weights/ directory
 
 
 class Upscaler:
@@ -460,23 +459,27 @@ class Upscaler:
         return frame_count
 
     async def _ensure_cugan_weights(self, scale: int) -> Path:
-        """Download Real-CUGAN weights for the given scale if not cached."""
-        import urllib.request
+        """Resolve Real-CUGAN weight file for the given scale.
 
+        Weights are bundled in the repo's weights/ directory.
+        """
         weight_name = f"up{scale}x-latest-denoise3x.pth"
-        model_dir = Path.home() / ".cache" / "realcugan"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        model_path = model_dir / weight_name
+        # Look in the bot's own weights/ directory (bundled in repo)
+        bot_dir = Path(__file__).parent
+        model_path = bot_dir / "weights" / weight_name
 
-        if not model_path.exists():
-            url = CUGAN_WEIGHT_URL.format(scale=scale)
-            logger.info("Downloading Real-CUGAN %dx weights from %s...", scale, url)
-            await asyncio.get_event_loop().run_in_executor(
-                None, urllib.request.urlretrieve, url, str(model_path),
-            )
-            logger.info("Model downloaded to %s", model_path)
+        if model_path.exists():
+            return model_path
 
-        return model_path
+        # Fallback: check ~/.cache/realcugan
+        cache_path = Path.home() / ".cache" / "realcugan" / weight_name
+        if cache_path.exists():
+            return cache_path
+
+        raise FileNotFoundError(
+            f"Real-CUGAN {scale}x weights not found at {model_path} or {cache_path}. "
+            f"Download from Google Drive and place in weights/ directory."
+        )
 
     async def _upscale_frames(
         self,

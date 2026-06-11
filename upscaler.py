@@ -206,6 +206,7 @@ class Upscaler:
 
             results: list[tuple[int, Path, int]] = []
             results_lock = asyncio.Lock()
+            reassembly_tasks: list[asyncio.Task] = []
 
             async def gpu_worker(worker_gpu: int) -> None:
                 """Worker loop: pull segments from queue and process on assigned GPU."""
@@ -254,37 +255,70 @@ class Upscaler:
                             gpu_id=worker_gpu,
                         )
 
-                        await self._reassemble_video(
+                        # Run reassembly in background so GPU can start next segment
+                        async def do_reassembly(
+                            idx: int,
+                            upscaled_dir: Path,
+                            seg_file: Path,
+                            out_path: Path,
+                            frames_dir: Path,
+                            upscaled_frames_dir: Path,
+                            n_frames: int,
+                        ):
+                            try:
+                                await self._reassemble_video(
+                                    upscaled_dir,
+                                    str(seg_file),
+                                    str(out_path),
+                                    fps,
+                                    target_w,
+                                    target_h,
+                                    gpu_id=worker_gpu,
+                                    frame_ext=Config.REALESRGAN_OUTPUT_FORMAT,
+                                )
+
+                                if not out_path.exists():
+                                    raise RuntimeError(f"Segment reassembly failed for {seg_file.name}")
+
+                                # Delete input segment NOW (after reassembly grabbed audio)
+                                try:
+                                    seg_file.unlink()
+                                except OSError:
+                                    pass
+
+                                fire_progress(idx, "upscale", n_frames, n_frames)
+
+                                async with results_lock:
+                                    results.append((idx, out_path, n_frames))
+                            finally:
+                                shutil.rmtree(frames_dir, ignore_errors=True)
+                                shutil.rmtree(upscaled_frames_dir, ignore_errors=True)
+
+                        # Start reassembly in background, don't wait
+                        task = asyncio.create_task(do_reassembly(
+                            index,
                             part_upscaled_dir,
-                            str(segment_file),
-                            str(part_output_path),
-                            fps,
-                            target_w,
-                            target_h,
-                            gpu_id=worker_gpu,
-                            frame_ext=Config.REALESRGAN_OUTPUT_FORMAT,
-                        )
+                            segment_file,
+                            part_output_path,
+                            part_frames_dir,
+                            part_upscaled_dir,
+                            extracted_frames,
+                        ))
+                        reassembly_tasks.append(task)
 
-                        if not part_output_path.exists():
-                            raise RuntimeError(f"Segment reassembly failed for {segment_file.name}")
-
-                        # Delete input segment NOW (after reassembly grabbed audio)
-                        try:
-                            segment_file.unlink()
-                        except OSError:
-                            pass
-
-                        fire_progress(index, "upscale", extracted_frames, extracted_frames)
-
-                        async with results_lock:
-                            results.append((index, part_output_path, extracted_frames))
-
-                    finally:
+                    except Exception:
+                        # Cleanup on error
                         shutil.rmtree(part_frames_dir, ignore_errors=True)
                         shutil.rmtree(part_upscaled_dir, ignore_errors=True)
+                        raise
 
             # Start one worker per GPU — they run truly in parallel
             await asyncio.gather(*(gpu_worker(g) for g in gpu_ids))
+            
+            # Wait for any remaining reassembly tasks
+            if reassembly_tasks:
+                await asyncio.gather(*reassembly_tasks, return_exceptions=True)
+            
             results.sort(key=lambda item: item[0])
             upscaled_segments = [path for _, path, _ in results]
 

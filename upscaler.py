@@ -580,7 +580,9 @@ class Upscaler:
                     continue
 
                 result = model(img, tile_mode=tile_mode, cache_mode=0, alpha=1)
-                result = np.clip(result * 255, 0, 255).astype(np.uint8)
+                # Real-CUGAN already returns uint8 (0-255), no scaling needed
+                if result.dtype != np.uint8:
+                    result = np.clip(result * 255, 0, 255).astype(np.uint8)
 
                 out_name = frame_file.stem + f".{output_format}"
                 cv2.imwrite(str(output_dir / out_name), result)

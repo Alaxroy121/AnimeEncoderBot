@@ -49,6 +49,11 @@ class Config:
     TG_UPLOAD_LIMIT: int = 2 * 1024 * 1024 * 1024 - 1024 * 1024  # ~2GB - 1MB margin
 
     # Google Drive (for files > 2GB)
+    # OAuth2 credentials (preferred — works with personal Gmail)
+    GDRIVE_CLIENT_ID: str = os.getenv("GDRIVE_CLIENT_ID", "")
+    GDRIVE_CLIENT_SECRET: str = os.getenv("GDRIVE_CLIENT_SECRET", "")
+    GDRIVE_REFRESH_TOKEN: str = os.getenv("GDRIVE_REFRESH_TOKEN", "")
+    # Legacy Service Account (deprecated — Google removed SA storage quota)
     GDRIVE_SA_JSON: str = os.getenv("GDRIVE_SA_JSON", "./sa.json")
     GDRIVE_FOLDER_ID: str = os.getenv("GDRIVE_FOLDER_ID", "")
 

@@ -645,6 +645,8 @@ class Upscaler:
             "-crf", "12",
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
+            # Ensure output fps matches input to prevent slow-motion
+            "-r", str(fps),
         ])
 
         cmd.extend([
@@ -656,6 +658,8 @@ class Upscaler:
             "-map", "0:v:0",   # Video from upscaled frames
             "-map", "1:a?",    # Audio from original
             "-map", "1:s?",    # Subtitles from original
+            # Force constant frame rate for better compatibility
+            "-vsync", "cfr",
             output_path,
         ])
 

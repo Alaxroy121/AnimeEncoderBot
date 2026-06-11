@@ -211,10 +211,30 @@ class Encoder:
             return self._has_av1_nvenc
         return False
 
+    def _calc_maxrate(self, width: int | None, height: int | None) -> str:
+        """Calculate appropriate maxrate based on resolution."""
+        if not width or not height:
+            return "50M"  # Safe default
+        pixels = width * height
+        if pixels >= 7680 * 4320:    # 8K
+            return "100M"
+        elif pixels >= 3840 * 2160:  # 4K
+            return "50M"
+        elif pixels >= 2560 * 1440:  # 2K/1440p
+            return "25M"
+        elif pixels >= 1920 * 1080:  # 1080p
+            return "15M"
+        elif pixels >= 1280 * 720:   # 720p
+            return "10M"
+        else:                        # SD or smaller
+            return "5M"
+
     def _hevc_nvenc_args(self, settings: EncodeSettings) -> list[str]:
         """HEVC NVENC arguments. Frames stay on GPU (cuda surfaces)."""
         preset = HEVC_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["hevc_cq"]
+        # Dynamic maxrate based on resolution (prevent bloat on small videos)
+        maxrate = self._calc_maxrate(settings.width, settings.height)
         args = [
             "-c:v", "hevc_nvenc",
             "-preset", preset,
@@ -222,8 +242,8 @@ class Encoder:
             "-rc", "vbr",
             "-cq", str(cq),
             "-b:v", "0",
-            "-maxrate", "100M",
-            "-bufsize", "200M",
+            "-maxrate", maxrate,
+            "-bufsize", f"{int(maxrate.rstrip('M')) * 2}M",
             "-spatial_aq", "1",
             "-temporal_aq", "1",
             "-rc-lookahead", "32",
@@ -240,6 +260,8 @@ class Encoder:
         """AV1 NVENC arguments (RTX 40xx+ GPUs)."""
         preset = AV1_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["av1_cq"]
+        # Dynamic maxrate based on resolution (prevent bloat on small videos)
+        maxrate = self._calc_maxrate(settings.width, settings.height)
         args = [
             "-c:v", "av1_nvenc",
             "-preset", preset,
@@ -247,8 +269,8 @@ class Encoder:
             "-rc", "vbr",
             "-cq", str(cq),
             "-b:v", "0",
-            "-maxrate", "100M",
-            "-bufsize", "200M",
+            "-maxrate", maxrate,
+            "-bufsize", f"{int(maxrate.rstrip('M')) * 2}M",
             "-spatial_aq", "1",
             "-temporal_aq", "1",
             "-rc-lookahead", "32",

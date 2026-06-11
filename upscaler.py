@@ -245,12 +245,6 @@ class Upscaler:
                         if extracted_frames == 0:
                             raise RuntimeError(f"Segment {segment_file.name} had 0 frames")
 
-                        # Delete input segment after extraction to free disk space
-                        try:
-                            segment_file.unlink()
-                        except OSError:
-                            pass
-
                         await self._upscale_frames(
                             part_frames_dir,
                             part_upscaled_dir,
@@ -273,6 +267,12 @@ class Upscaler:
 
                         if not part_output_path.exists():
                             raise RuntimeError(f"Segment reassembly failed for {segment_file.name}")
+
+                        # Delete input segment NOW (after reassembly grabbed audio)
+                        try:
+                            segment_file.unlink()
+                        except OSError:
+                            pass
 
                         fire_progress(index, "upscale", extracted_frames, extracted_frames)
 

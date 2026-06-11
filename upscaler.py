@@ -602,11 +602,11 @@ class Upscaler:
         ]
 
         # Use near-lossless H.264 intermediate so encoder.py controls final quality.
-        # -crf 4 is visually lossless but MUCH smaller than -crf 0 (saves disk space).
+        # -crf 12 balances quality vs disk space for intermediates (final encode sets quality).
         logger.info(f"Reassembling with near-lossless H.264 intermediate (GPU {gpu_id})")
         cmd.extend([
             "-c:v", "libx264",
-            "-crf", "4",
+            "-crf", "12",
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
         ])
@@ -640,7 +640,7 @@ class Upscaler:
                     "-i", str(frames_dir / f"frame_%08d.{frame_ext}"),
                     "-i", original_input,
                     "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
-                    "-c:v", "libx264", "-crf", "4", "-preset", "ultrafast",
+                    "-c:v", "libx264", "-crf", "12", "-preset", "ultrafast",
                     "-pix_fmt", "yuv420p",
                     "-c:a", "copy", "-c:s", "copy",
                     "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",

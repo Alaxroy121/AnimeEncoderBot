@@ -134,6 +134,8 @@ class Encoder:
         input_path: str,
         output_path: str,
         settings: EncodeSettings,
+        width: int = 0,
+        height: int = 0,
     ) -> list[str]:
         """Build the full FFmpeg command. GPU-first approach."""
         cmd: list[str] = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
@@ -156,7 +158,7 @@ class Encoder:
         # ── Video Codec — GPU first ──
         if settings.codec == "hevc":
             if use_gpu and self._has_hevc_nvenc:
-                cmd.extend(self._hevc_nvenc_args(settings))
+                cmd.extend(self._hevc_nvenc_args(settings, width, height))
                 logger.info(f"Using HEVC NVENC (GPU {settings.gpu_id if settings.gpu_id is not None else 0})")
             else:
                 cmd.extend(self._hevc_cpu_args(settings))
@@ -164,7 +166,7 @@ class Encoder:
 
         elif settings.codec == "av1":
             if use_gpu and self._has_av1_nvenc:
-                cmd.extend(self._av1_nvenc_args(settings))
+                cmd.extend(self._av1_nvenc_args(settings, width, height))
                 logger.info(f"Using AV1 NVENC (GPU {settings.gpu_id if settings.gpu_id is not None else 0})")
             else:
                 cmd.extend(self._svt_av1_args(settings))
@@ -229,12 +231,12 @@ class Encoder:
         else:                        # SD or smaller
             return "5M"
 
-    def _hevc_nvenc_args(self, settings: EncodeSettings) -> list[str]:
+    def _hevc_nvenc_args(self, settings: EncodeSettings, width: int = 0, height: int = 0) -> list[str]:
         """HEVC NVENC arguments. Frames stay on GPU (cuda surfaces)."""
         preset = HEVC_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["hevc_cq"]
         # Dynamic maxrate based on resolution (prevent bloat on small videos)
-        maxrate = self._calc_maxrate(settings.width, settings.height)
+        maxrate = self._calc_maxrate(width, height)
         args = [
             "-c:v", "hevc_nvenc",
             "-preset", preset,
@@ -256,12 +258,12 @@ class Encoder:
             args.extend(["-gpu", str(settings.gpu_id)])
         return args
 
-    def _av1_nvenc_args(self, settings: EncodeSettings) -> list[str]:
+    def _av1_nvenc_args(self, settings: EncodeSettings, width: int = 0, height: int = 0) -> list[str]:
         """AV1 NVENC arguments (RTX 40xx+ GPUs)."""
         preset = AV1_NVENC_PRESETS.get(settings.preset, "p5")
         cq = QUALITY_MAP[settings.quality]["av1_cq"]
         # Dynamic maxrate based on resolution (prevent bloat on small videos)
-        maxrate = self._calc_maxrate(settings.width, settings.height)
+        maxrate = self._calc_maxrate(width, height)
         args = [
             "-c:v", "av1_nvenc",
             "-preset", preset,
@@ -331,7 +333,9 @@ class Encoder:
             logger.warning("No GPU — falling back to CPU encoding (will be slow)")
             settings.use_gpu = False
 
-        cmd = self._build_command(input_path, output_path, settings)
+        # Get resolution for dynamic bitrate calculation
+        width, height = await self._get_resolution(input_path)
+        cmd = self._build_command(input_path, output_path, settings, width, height)
         logger.info("Encoding command: %s", " ".join(cmd))
 
         duration = await self._get_duration(input_path)
@@ -389,7 +393,7 @@ class Encoder:
                     stderr_output[-5:] if stderr_output else "unknown",
                 )
                 settings.use_gpu = False
-                cmd = self._build_command(input_path, output_path, settings)
+                cmd = self._build_command(input_path, output_path, settings, width, height)
                 logger.info("CPU fallback command: %s", " ".join(cmd))
 
                 proc = await asyncio.create_subprocess_exec(
@@ -445,6 +449,26 @@ class Encoder:
             return float(stdout.decode().strip())
         except Exception:
             return 0.0
+
+    async def _get_resolution(self, file_path: str) -> tuple[int, int]:
+        """Get video resolution (width, height) using ffprobe."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0",
+                file_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            parts = stdout.decode().strip().split(",")
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return 0, 0
 
     @staticmethod
     def get_supported_codecs() -> dict[str, str]:

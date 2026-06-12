@@ -480,7 +480,9 @@ class Upscaler:
             "-i", input_path,
             "-pix_fmt", "yuvj420p",
             "-q:v", "2",
-            "-vsync", "vfr",
+            # Use CFR extraction to ensure consistent frame timing
+            # VFR causes desync when reassembling with constant framerate
+            "-vsync", "cfr",
             str(frames_dir / "frame_%08d.jpg"),
         ]
         proc = await asyncio.create_subprocess_exec(

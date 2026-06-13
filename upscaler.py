@@ -242,7 +242,6 @@ class Upscaler:
                             part_frames_dir,
                             expected_frames=expected_segment_frames,
                             progress_callback=lambda done, _total, idx=index, exp=expected_segment_frames: fire_progress(idx, "extract", done, exp),
-                            fps=fps,
                         )
                         if extracted_frames == 0:
                             raise RuntimeError(f"Segment {segment_file.name} had 0 frames")
@@ -423,11 +422,15 @@ class Upscaler:
         return 0
 
     async def _get_video_info(self, file_path: str) -> dict:
-        """Get basic video info (width, height, fps)."""
+        """Get basic video info (width, height, fps).
+        
+        Uses avg_frame_rate instead of r_frame_rate for more accurate
+        playback timing, especially with VFR content.
+        """
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "quiet",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate",
+            "-show_entries", "stream=width,height,avg_frame_rate",
             "-of", "csv=p=0",
             file_path,
             stdout=asyncio.subprocess.PIPE,
@@ -474,18 +477,15 @@ class Upscaler:
         frames_dir: Path,
         expected_frames: int = 0,
         progress_callback: Optional[Callable[[int, int], None]] = None,
-        fps: float = 30.0,
     ) -> int:
         """Extract frames from a segment and report progress while ffmpeg runs."""
+        # Simple extraction - let ffmpeg handle timing naturally
+        # Don't force fps here, just extract all frames as they exist
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-i", input_path,
             "-pix_fmt", "yuvj420p",
             "-q:v", "2",
-            # Force output framerate to match source fps exactly
-            # This prevents timing issues from VFR sources or container mismatches
-            "-r", str(fps),
-            "-vsync", "cfr",
             str(frames_dir / "frame_%08d.jpg"),
         ]
         proc = await asyncio.create_subprocess_exec(
@@ -646,22 +646,15 @@ class Upscaler:
         # -crf 12 balances quality vs disk space for intermediates (final encode sets quality).
         logger.info(f"Reassembling with near-lossless H.264 intermediate (GPU {gpu_id})")
         
-        # Force exact output fps and use pts-based timing to prevent slow-motion
         cmd.extend([
             "-c:v", "libx264",
             "-crf", "12",
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
-            # Force exact frame rate
-            "-r", str(fps),
-            # Use timestamps from input frames (which are at constant rate)
-            "-fps_mode", "cfr",
-            # Set video timebase to match fps for precise timing
-            "-video_track_timescale", str(int(fps * 1000)),
         ])
 
         cmd.extend([
-            # Copy audio from original
+            # Copy audio from original segment (preserves sync)
             "-c:a", "copy",
             # Copy subtitles
             "-c:s", "copy",

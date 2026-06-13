@@ -242,6 +242,7 @@ class Upscaler:
                             part_frames_dir,
                             expected_frames=expected_segment_frames,
                             progress_callback=lambda done, _total, idx=index, exp=expected_segment_frames: fire_progress(idx, "extract", done, exp),
+                            fps=fps,
                         )
                         if extracted_frames == 0:
                             raise RuntimeError(f"Segment {segment_file.name} had 0 frames")
@@ -473,6 +474,7 @@ class Upscaler:
         frames_dir: Path,
         expected_frames: int = 0,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        fps: float = 30.0,
     ) -> int:
         """Extract frames from a segment and report progress while ffmpeg runs."""
         cmd = [
@@ -480,8 +482,9 @@ class Upscaler:
             "-i", input_path,
             "-pix_fmt", "yuvj420p",
             "-q:v", "2",
-            # Use CFR extraction to ensure consistent frame timing
-            # VFR causes desync when reassembling with constant framerate
+            # Force output framerate to match source fps exactly
+            # This prevents timing issues from VFR sources or container mismatches
+            "-r", str(fps),
             "-vsync", "cfr",
             str(frames_dir / "frame_%08d.jpg"),
         ]
@@ -642,13 +645,19 @@ class Upscaler:
         # Use near-lossless H.264 intermediate so encoder.py controls final quality.
         # -crf 12 balances quality vs disk space for intermediates (final encode sets quality).
         logger.info(f"Reassembling with near-lossless H.264 intermediate (GPU {gpu_id})")
+        
+        # Force exact output fps and use pts-based timing to prevent slow-motion
         cmd.extend([
             "-c:v", "libx264",
             "-crf", "12",
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
-            # Ensure output fps matches input to prevent slow-motion
+            # Force exact frame rate
             "-r", str(fps),
+            # Use timestamps from input frames (which are at constant rate)
+            "-fps_mode", "cfr",
+            # Set video timebase to match fps for precise timing
+            "-video_track_timescale", str(int(fps * 1000)),
         ])
 
         cmd.extend([
@@ -660,8 +669,6 @@ class Upscaler:
             "-map", "0:v:0",   # Video from upscaled frames
             "-map", "1:a?",    # Audio from original
             "-map", "1:s?",    # Subtitles from original
-            # Force constant frame rate for better compatibility
-            "-vsync", "cfr",
             output_path,
         ])
 

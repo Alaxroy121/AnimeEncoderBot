@@ -335,10 +335,14 @@ class Upscaler:
             output_path = get_output_path(input_path, f"upscaled_{target_resolution}", ".mkv")
             concat_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                # Regenerate timestamps to fix segment boundary issues
+                "-fflags", "+genpts+igndts",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", str(concat_txt_path),
                 "-c", "copy",
+                # Avoid negative timestamps that can cause playback issues
+                "-avoid_negative_ts", "make_zero",
                 output_path,
             ]
             _, stderr = await self._run_process(concat_cmd)
@@ -662,6 +666,9 @@ class Upscaler:
             "-map", "0:v:0",   # Video from upscaled frames
             "-map", "1:a?",    # Audio from original
             "-map", "1:s?",    # Subtitles from original
+            # Start timestamps from zero for clean concatenation
+            "-start_at_zero",
+            "-avoid_negative_ts", "make_zero",
             output_path,
         ])
 
